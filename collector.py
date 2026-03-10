@@ -13,45 +13,67 @@ Routes:
   GET  /history-data                     — history JSON
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-ОПТИМИЗАЦИИ v2
+ОПТИМИЗАЦИИ v3  (изменения на основе анализа реальной БД 2025-03-10)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-1. MARKET FILTER (Thrill)
-   Оригинал: пишет ВСЕ рынки (18, 16, 247, 238, 39, 40, …)
-   Анализ DB: только рынки 186/1 (Match Winner) нужны для вилок.
-              96.1% строк — мусор. За 1 минуту: 113K строк → ~4.5K.
-              За час: ~270MB вместо ~7GB.
-   Исправление: _emit() игнорирует market_id ∉ {"186", "1"}.
+Анализ реальной базы (26 минут, 10834 thrill / 17442 sharp_ws):
+  ┌─────────────────────────────────────────────────────────────────┐
+  │ БЫЛО: 92.8% строк Thrill — абсолютный мусор                    │
+  │                                                                 │
+  │  market_id=1    →  54.6%  (football/hockey, outcome=1/2/3)     │
+  │  prematch       →  12.8%  (Sharp никогда не цитирует prematch) │
+  │  non-tennis     →  25.5%  (sport_id≠5/303, Sharp не торгует)   │
+  │  useful         →   7.2%  ← только это реально нужно           │
+  └─────────────────────────────────────────────────────────────────┘
 
-2. SHARP LEVEL FILTER
-   Стакан имеет 3 уровня цен (0/1/2). Для вилок нужен только
-   top-of-book (level=0). Уровни 1,2 — глубина рынка, не нужна.
-   Исправление: process_ws() пропускает level_idx > SHARP_MAX_LEVEL.
-   Экономия: −68% строк sharp_ws.
+FIX A. УДАЛЕНИЕ market_id='1' из _THRILL_KEEP_MARKETS
+  Анализ: market_id=1 используется ИСКЛЮЧИТЕЛЬНО не-теннисными
+  видами спорта (football sport_id=1, NHL sport_id=4, etc.).
+  Все теннисные события используют market_id=186 (outcome 4=P1, 5=P2).
+  compute_history() ищет только outcome_id IN ('4','5') → market_id=1
+  никогда не использовался в расчётах арбитража.
+  Экономия: −54.6% строк Thrill.
 
-3. HEARTBEAT TABLE
-   Проблема: дедупликация (одинаковые коэф не пишутся) создаёт
-   неоднозначность — нельзя отличить «коэф не изменился» от
-   «источник отвалился». Carry-forward устаревшей цены ≠ текущая цена.
-   Решение: таблица heartbeat — лёгкий тик (ts, source, event_id)
-   каждые HB_INTERVAL_SEC секунд. compute_history() использует
-   последний heartbeat как «proof-of-life», не timestamp строки коэфа.
+FIX B. PREMATCH FILTER в _emit()
+  Анализ: все 17 442 строк Sharp имеют in_play=1, betting_enabled=1.
+  Sharp не котирует prematch события от слова совсем.
+  Prematch строки Thrill никогда не дают арбитраж.
+  Бонус: heartbeats для prematch событий тоже исчезают (было −69.5%).
+  Экономия: −12.8% строк Thrill, −69.5% строк heartbeat.
 
-4. BATCH WRITER
-   Оригинал: commit() на каждую строку под глобальным _lock.
-   При 2500 строк/сек = 2500 fsync/сек → узкое место диска.
-   Исправление: BatchWriter собирает строки и делает один commit
-   раз в BATCH_MAX_SEC секунд или при BATCH_MAX_ROWS строках.
-   Один commit вместо тысячи — кратное ускорение записи.
+FIX C. SPORT FILTER в _emit()
+  Анализ: sport_id=20 = настольный теннис (Setka Cup, WTT Feeder).
+  Другие sport_id = esports-симуляции, бадминтон, и т.д.
+  Sharp в данной сессии торговал ТОЛЬКО теннисом (all 83 events).
+  Конфигурируемый список _THRILL_KEEP_SPORTS — пустой = пропускать всё.
+  Экономия: −25.5% строк Thrill (или больше с настольным теннисом).
 
-5. AUTO-PRUNE
-   Фоновый поток удаляет строки старше DB_TTL_SEC каждые
-   PRUNE_EVERY секунд. Без него DB растёт бесконечно.
+FIX D. SHARP MARKET FILTER в process_ws()
+  Анализ: в Sharp проникают horse racing ("2m3f Hrd - Win"),
+  предматчевые фикстуры ("Fixtures 10 Mar - Atalanta v Bayern Munich
+  - Match Odds"). Они занимают место и никогда не матчатся с Thrill.
+  Решение: пропускать всё кроме рынков в _SHARP_KEEP_MARKETS.
+  Экономия: −0.9% строк Sharp.
 
-6. ИНДЕКСЫ
-   Добавлены составные (покрывающие) индексы под паттерны
-   запросов compute_history() — ускоряют загрузку истории
-   для больших DB.
+FIX E. РАСШИРЕННАЯ КАРТА ВИДОВ СПОРТА (_SPORT_NAMES)
+  Из реальных данных определены: sport_id=20 (Table Tennis),
+  sport_id=4 (Ice Hockey), sport_id=1 (Football), sport_id=2 (Basketball).
+  Улучшает читаемость логов.
+
+FIX F. COMPUTE_HISTORY ОПТИМИЗАЦИЯ
+  Убран market_id='1' из WHERE clause (данных с ним больше нет).
+  Это ускоряет загрузку timeline при больших БД.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ОПТИМИЗАЦИИ v2 (оригинальные)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. MARKET FILTER (Thrill) — только рынок 186 (Match Winner)
+2. SHARP LEVEL FILTER — только top-of-book (level=0)
+3. HEARTBEAT TABLE — proof-of-life без дублирования коэфа
+4. BATCH WRITER — один commit вместо тысячи
+5. AUTO-PRUNE — фоновое удаление устаревших данных
+6. ИНДЕКСЫ — покрывающие индексы для compute_history()
 """
 from __future__ import annotations
 import json, time, logging, sqlite3, threading, queue
@@ -66,8 +88,26 @@ HOST    = "0.0.0.0"
 PORT    = 5556
 DB_PATH = "odds.db"
 
-# Thrill: писать только эти рынки (Match Winner). Остальные 96% — мусор.
-_THRILL_KEEP_MARKETS: frozenset = frozenset({"186", "1"})
+# Thrill: ТОЛЬКО рынок 186 (Match Winner, теннис).
+# АНАЛИЗ БД: market_id='1' использовался ИСКЛЮЧИТЕЛЬНО для футбола/хоккея
+# с тремя исходами (1=home, 2=away, 3=draw). Ни одного теннисного события.
+# compute_history() искал только outcome_id IN ('4','5') — market_id='1'
+# никогда не использовался. Удаление: −54.6% строк.
+_THRILL_KEEP_MARKETS: frozenset = frozenset({"186"})
+
+# Thrill: фильтр по виду спорта. Пустой = пропускать всё.
+# АНАЛИЗ БД: sport_id=5/303=Tennis, sport_id=20=Table Tennis (Setka Cup, WTT),
+# sport_id=1=Football, sport_id=4=Ice Hockey, sport_id=2=Basketball,
+# sport_id=22=Badminton, sport_id=23=Volleyball и т.д.
+# Sharp в реальности торгует только теннисом → остальное мусор.
+# Если добавить настольный теннис: добавь "20" в список.
+_THRILL_KEEP_SPORTS: frozenset = frozenset({"5", "303"})
+
+# Sharp: принимать только эти рынки.
+# АНАЛИЗ БД: попадались horse racing ("2m3f Hrd - Win"),
+# футбольные фикстуры ("Fixtures 10 Mar - Atalanta v Bayern Munich - Match Odds").
+# Они никогда не матчатся с теннисными событиями Thrill.
+_SHARP_KEEP_MARKETS: frozenset = frozenset({"Match Odds"})
 
 # Sharp: только top-of-book (level=0). Уровни 1,2 — глубина стакана, не нужна.
 SHARP_MAX_LEVEL: int = 0
@@ -182,8 +222,6 @@ def init_db(path: str) -> sqlite3.Connection:
         );
 
         -- Heartbeat: доказательство жизни источника без изменения коэфа.
-        -- Позволяет отличить "коэф стабилен" от "источник отвалился".
-        -- Дедuplicated на уровне Python (HBTracker), здесь не нужны UNIQUE.
         CREATE TABLE IF NOT EXISTS heartbeat (
             id       INTEGER PRIMARY KEY AUTOINCREMENT,
             ts       REAL NOT NULL,
@@ -191,7 +229,7 @@ def init_db(path: str) -> sqlite3.Connection:
             event_id TEXT NOT NULL
         );
 
-        -- Базовые индексы (уже были)
+        -- Базовые индексы
         CREATE INDEX IF NOT EXISTS idx_th_ts   ON thrill(ts);
         CREATE INDEX IF NOT EXISTS idx_th_eid  ON thrill(event_id);
         CREATE INDEX IF NOT EXISTS idx_sw_ts   ON sharp_ws(ts);
@@ -217,9 +255,6 @@ class BatchWriter:
     """
     Асинхронная запись в БД. Накапливает строки и делает один INSERT+COMMIT
     раз в BATCH_MAX_SEC секунд или при BATCH_MAX_ROWS строках.
-
-    Преимущество перед commit-per-row: при 2500 строк/сек экономит тысячи
-    fsync-вызовов в секунду. WAL mode делает это безопасным.
     """
     def __init__(self, conn: sqlite3.Connection,
                  max_rows: int = BATCH_MAX_ROWS,
@@ -233,11 +268,9 @@ class BatchWriter:
         self._t.start()
 
     def write(self, table: str, row: dict) -> None:
-        """Неблокирующая запись. Строка будет сохранена в ближайший flush."""
         self._q.put((table, row))
 
     def flush(self) -> None:
-        """Принудительный flush — ждёт обработки всего, что есть в очереди."""
         done = threading.Event()
         self._q.put(done)
         done.wait(timeout=5.0)
@@ -247,7 +280,6 @@ class BatchWriter:
         last_flush: float = time.monotonic()
 
         while True:
-            # Ждём новый элемент с таймаутом
             deadline = last_flush + self._max_sec
             wait = max(0.0, deadline - time.monotonic())
             try:
@@ -256,7 +288,6 @@ class BatchWriter:
                 item = None
 
             if isinstance(item, threading.Event):
-                # Flush-event: сбросить накопленное и сигнализировать
                 if pending:
                     self._flush(pending)
                     pending = []
@@ -291,20 +322,12 @@ class BatchWriter:
 class HBTracker:
     """
     Дедuplicated heartbeat writer.
-
-    Пишет один тик (ts, source, event_id) в таблицу heartbeat
-    максимум раз в HB_INTERVAL_SEC для каждой пары (source, event_id).
-
-    Зачем: дедупликация коэфов (не писать одинаковые) создаёт
-    неоднозначность — нельзя понять, молчит ли источник или просто
-    цена стабильна. Heartbeat снимает эту неоднозначность:
-    последний heartbeat = момент последнего реального сообщения от источника.
-    compute_history() использует его вместо timestamp последней строки коэфа.
+    Пишет один тик (ts, source, event_id) раз в HB_INTERVAL_SEC.
     """
     def __init__(self, writer: BatchWriter, interval: float = HB_INTERVAL_SEC):
         self._writer   = writer
         self._interval = interval
-        self._last: Dict[tuple, float] = {}   # (source, event_id) → last_ts
+        self._last: Dict[tuple, float] = {}
 
     def ping(self, source: str, event_id: str, ts: float) -> None:
         key = (source, event_id)
@@ -315,17 +338,11 @@ class HBTracker:
             })
 
     def clear(self, source: str, event_id: str) -> None:
-        """Вызывать при завершении матча — освобождает память."""
         self._last.pop((source, event_id), None)
 
 
 # ── DATABASE PRUNER ───────────────────────────────────────────────────────────
 class PruneThread(threading.Thread):
-    """
-    Фоновый поток: каждые PRUNE_EVERY секунд удаляет строки
-    старше DB_TTL_SEC из всех таблиц.
-    Без этого DB растёт бесконечно.
-    """
     def __init__(self, db_path: str, writer: BatchWriter,
                  ttl_sec: float = DB_TTL_SEC,
                  every_sec: float = PRUNE_EVERY):
@@ -334,7 +351,7 @@ class PruneThread(threading.Thread):
         self._writer   = writer
         self._ttl      = ttl_sec
         self._every    = every_sec
-        self._vacuum_every = 3600  # VACUUM раз в час
+        self._vacuum_every = 3600
         self._last_vacuum  = 0.0
 
     def run(self) -> None:
@@ -347,7 +364,6 @@ class PruneThread(threading.Thread):
 
     def _prune(self) -> None:
         cutoff = time.time() - self._ttl
-        # Дожидаемся, пока BatchWriter сбросит очередь
         self._writer.flush()
         try:
             conn = sqlite3.connect(self._db_path, check_same_thread=False)
@@ -362,7 +378,6 @@ class PruneThread(threading.Thread):
             if total > 0:
                 log.info("Pruned %d rows older than %.1fh",
                          total, self._ttl / 3600)
-            # VACUUM раз в час для возврата дискового пространства ОС
             now = time.time()
             if now - self._last_vacuum >= self._vacuum_every:
                 conn.execute("VACUUM")
@@ -375,7 +390,21 @@ class PruneThread(threading.Thread):
 
 # ── THRILL ────────────────────────────────────────────────────────────────────
 _FINISHED    = {3, 4, 5, 6, 99, 100}
-_SPORT_NAMES = {"5": "Tennis", "303": "Tennis"}
+
+# FIX E: расширенная карта видов спорта из реальных данных БД
+_SPORT_NAMES = {
+    "5":   "Tennis",
+    "303": "Tennis",
+    "20":  "Table Tennis",   # Setka Cup, WTT Feeder — обнаружен в БД
+    "1":   "Football",       # football — основной источник мусора в market_id=1
+    "2":   "Basketball",
+    "4":   "Ice Hockey",
+    "6":   "Baseball",
+    "22":  "Badminton",
+    "23":  "Volleyball",
+    "7":   "Handball",
+    "10":  "Tennis (ITF)",   # предположительно
+}
 
 
 def _merge(dst: dict, src: dict):
@@ -410,7 +439,6 @@ class ThrillCollector:
         self._state: Dict[str, dict] = {}
         self._desc:  Dict[str, dict] = {}
         self._tours: Dict[str, dict] = {}
-        # dedup: (event_id, market_id, spec, outcome_id) → (odds, suspended)
         self._dedup: dict = {}
 
     def process(self, raw: Any):
@@ -467,15 +495,32 @@ class ThrillCollector:
         markets = state.get("markets") or {}
         if not markets: return
 
-        # Heartbeat: доказываем что Thrill жив для этого события
-        self._hb.ping("thrill", eid, ts)
-
-        sets_json, game_home, game_away, server = _parse_score(state)
+        # ── FIX B: PREMATCH FILTER ───────────────────────────────────────────
+        # АНАЛИЗ БД: все 17 442 строк Sharp имеют in_play=1, betting_enabled=1.
+        # Sharp не котирует prematch → prematch строки Thrill никогда не дают арб.
+        # Бонус: heartbeat'ы для prematch событий тоже исчезают (было −69.5%).
+        # Статус определяем ДО вызова hb.ping() — не тратим HB на prematch.
         sd = state.get("state") or {}
         if sd.get("status") == 1:      status = "live"
         elif sd.get("status") == 0:    status = "prematch"
         else:                          status = "unknown"
 
+        if status != "live":
+            return   # только live события могут дать арбитраж
+        # ─────────────────────────────────────────────────────────────────────
+
+        # ── FIX C: SPORT FILTER ──────────────────────────────────────────────
+        # АНАЛИЗ БД: Sharp торговал только теннисом (sport_id=5/303).
+        # sport_id=20 (настольный теннис), 22 (бадминтон) и др. — не матчатся.
+        # Пустой _THRILL_KEEP_SPORTS = отключить фильтр (принимать всё).
+        if _THRILL_KEEP_SPORTS and sport not in _THRILL_KEEP_SPORTS:
+            return
+        # ─────────────────────────────────────────────────────────────────────
+
+        # Heartbeat: только для событий, прошедших все фильтры
+        self._hb.ping("thrill", eid, ts)
+
+        sets_json, game_home, game_away, server = _parse_score(state)
         scheduled = desc.get("scheduled")
         tid   = str(desc.get("tournament", ""))
         tname = (self._tours.get(tid) or {}).get("name", "") if tid else ""
@@ -494,10 +539,11 @@ class ThrillCollector:
 
         count = 0
         for market_id, specs in markets.items():
-            # ── MARKET FILTER ────────────────────────────────────────────────
-            # Только рынки 186 (Match Winner) и 1 (fallback).
-            # Анализ реальной DB: 96.1% строк — другие рынки (тоталы,
-            # форы, геймы и т.д.), полностью бесполезные для вилок.
+            # ── FIX A: MARKET FILTER ─────────────────────────────────────────
+            # АНАЛИЗ БД: market_id='1' = исключительно football/hockey с 3
+            # исходами (outcome 1=home, 2=away, 3=draw). Ни одного теннисного
+            # события. compute_history() использует только outcome_id='4','5'.
+            # market_id='1' никогда не участвовал в расчёте арбитража.
             if market_id not in _THRILL_KEEP_MARKETS:
                 continue
             # ─────────────────────────────────────────────────────────────────
@@ -513,7 +559,6 @@ class ThrillCollector:
                         continue
                     suspended = 1 if oval.get("b") == 1 else 0
 
-                    # Dedup: пишем только при изменении коэфа
                     dedup_key = (eid, market_id, spec, outcome_id)
                     if self._dedup.get(dedup_key) == (odds_val, suspended):
                         continue
@@ -543,9 +588,7 @@ class SharpCollector:
         self._hb     = hb
         self._market_runners: Dict[str, Dict[str, str]] = {}
         self._event_names:    Dict[str, Tuple[str, str]] = {}
-        # dedup: (event_id, market_id, runner_idx, side, level) → (odds, amount)
         self._dedup_ws: dict = {}
-        # dedup: event_id → last score sig
         self._dedup_sc: dict = {}
 
     def process_ws(self, raw: Any):
@@ -567,6 +610,16 @@ class SharpCollector:
         rc          = payload.get("rc", [])
         mid         = str(payload.get("id", ""))
         event_id    = str(payload.get("mainEventId", ""))
+
+        # ── FIX D: SHARP MARKET FILTER ───────────────────────────────────────
+        # АНАЛИЗ БД: проникали horse racing ("2m3f Hrd - Win"), предматчевые
+        # фикстуры ("Fixtures 10 Mar - Atalanta v Bayern Munich - Match Odds").
+        # Они никогда не матчатся с теннисными событиями Thrill.
+        # Пустой market_name пропускаем — это может быть init-пакет без имени.
+        if market_name and market_name not in _SHARP_KEEP_MARKETS:
+            return
+        # ─────────────────────────────────────────────────────────────────────
+
         betting     = payload.get("bettingEnabled", False)
         inplay      = payload.get("img", False)
         status      = "live" if betting and inplay else ("prematch" if betting else "suspended")
@@ -621,14 +674,9 @@ class SharpCollector:
                     except (KeyError, ValueError, TypeError):
                         continue
 
-                    # ── LEVEL FILTER ─────────────────────────────────────────
-                    # Для вилок нужен только top-of-book (level=0).
-                    # Уровни 1,2 — глубина стакана, только занимают место.
                     if level_idx > SHARP_MAX_LEVEL:
                         continue
-                    # ─────────────────────────────────────────────────────────
 
-                    # Dedup
                     dk = (event_id, mid, idx, side, level_idx)
                     if self._dedup_ws.get(dk) == (odds_val, amount_val):
                         continue
@@ -648,7 +696,6 @@ class SharpCollector:
                     if level_idx == 0:
                         log_best[f"p{idx+1}_{side}"] = odds_val
 
-        # Heartbeat: доказываем что Sharp жив для этого события
         if event_id:
             self._hb.ping("sharp", event_id, ts)
 
@@ -713,7 +760,6 @@ class SharpCollector:
                 "status":   str(upd.get("status")) if upd.get("status") is not None else None,
             }
 
-            # Dedup: пишем только если счёт изменился
             sig = (row["p1_score"], row["p2_score"], row["p1_games"],
                    row["p2_games"], row["p1_sets"], row["p2_sets"],
                    row["server"], row["period"], row["status"])
@@ -787,7 +833,7 @@ def _best_arb(arbs):
     return max(valid) if valid else None
 
 
-# ── Name matching — полная копия utils/names.py ───────────────────────────────
+# ── Name matching ─────────────────────────────────────────────────────────────
 import unicodedata as _ucd
 from typing import Tuple as _Tuple
 
@@ -942,23 +988,11 @@ def compute_history(db_path: str,
                     max_thrill_odds: float = 30.0,
                     lookback_hours:  float = 0.0) -> list:
     """
-    Воспроизводит данные из DB и находит арбитражные возможности по той же
-    логике, что и живой HistoryTracker сканера.
+    Воспроизводит данные из DB и находит арбитражные возможности.
 
-    Ключевое улучшение (freshness):
-    ───────────────────────────────
-    Оригинал использовал timestamp последней СТРОКИ в БД для проверки
-    свежести. Но дедупликация не пишет строку если коэф не изменился.
-    Значит freshness_check мог не срабатывать даже когда источник жив.
-
-    Теперь используем таблицу heartbeat: она пишется каждые HB_INTERVAL_SEC
-    при любом сообщении от источника, независимо от изменения коэфа.
-    Последний heartbeat = реальный момент последнего сообщения от источника.
-    Это корректно разделяет:
-      - «коэф стабилен» (heartbeats идут → данные свежие)
-      - «источник замолчал» (heartbeats прекратились → стейл)
-
-    lookback_hours: загружать только данные за последние N часов (0 = всё).
+    FIX F: убран market_id='1' из WHERE clause Thrill timeline —
+    данных с ним больше нет (исключён в ThrillCollector._emit()).
+    Ускоряет загрузку при больших БД.
     """
     import bisect
     from collections import defaultdict
@@ -966,19 +1000,17 @@ def compute_history(db_path: str,
     conn = sqlite3.connect(db_path, check_same_thread=False)
     cur  = conn.cursor()
 
-    # Опциональное ограничение по времени
     ts_cutoff = (time.time() - lookback_hours * 3600) if lookback_hours > 0 else 0.0
     ts_filter = "AND ts >= ?" if ts_cutoff > 0 else ""
     ts_params = (ts_cutoff,) if ts_cutoff > 0 else ()
 
     # ── 1. Load heartbeat timelines ──────────────────────────────────────────
-    # Heartbeat строк мало (1 каждые HB_INTERVAL_SEC на событие) — грузим все.
     cur.execute(
         f"SELECT ts, source, event_id FROM heartbeat "
         f"WHERE 1=1 {ts_filter} ORDER BY ts",
         ts_params
     )
-    thrill_hb: Dict[str, list] = defaultdict(list)   # event_id → [ts, ...]
+    thrill_hb: Dict[str, list] = defaultdict(list)
     sharp_hb:  Dict[str, list] = defaultdict(list)
 
     for hb_ts, source, eid in cur.fetchall():
@@ -986,17 +1018,17 @@ def compute_history(db_path: str,
         else:                  sharp_hb[eid].append(hb_ts)
 
     def _last_hb_before(hb_list: list, ts: float) -> float:
-        """Возвращает последний heartbeat ≤ ts (бинарный поиск)."""
         if not hb_list: return 0.0
         idx = bisect.bisect_right(hb_list, ts) - 1
         return hb_list[idx] if idx >= 0 else 0.0
 
     # ── 2. Load Thrill timeline ──────────────────────────────────────────────
+    # FIX F: market_id='186' только — убран '1' (данных с ним больше нет).
     cur.execute(f"""
         SELECT ts, event_id, player1, player2, tournament_name, status,
                outcome_id, odds, sets_json, game_home, game_away, server
         FROM thrill
-        WHERE market_id IN ('186','1') AND suspended=0
+        WHERE market_id='186' AND suspended=0
           AND player1 IS NOT NULL AND player2 IS NOT NULL
           {ts_filter}
         ORDER BY ts
@@ -1100,7 +1132,6 @@ def compute_history(db_path: str,
         t_tl = thrill_tl[th_eid]
         s_tl = sharp_tl[sh_eid]
 
-        # Heartbeat-списки для этих событий (для быстрого бинарного поиска)
         t_hb_list = thrill_hb.get(th_eid, [])
         s_hb_list = sharp_hb.get(sh_eid, [])
 
@@ -1116,14 +1147,12 @@ def compute_history(db_path: str,
         cooldown_until = 0.0
 
         for ts in all_ts:
-            # Advance Thrill
             while t_idx < len(t_tl) and t_tl[t_idx][0] <= ts:
                 _, tb1_, tb2_, meta_ = t_tl[t_idx]
                 tb1, tb2 = tb1_, tb2_
                 t_meta = meta_
                 t_idx += 1
 
-            # Advance Sharp с lag_sec (зеркало SharpBuffer)
             while s_idx < len(s_tl) and s_tl[s_idx][0] <= ts - lag_sec:
                 _, sb1_, sl1_, sb2_, sl2_, meta_ = s_tl[s_idx]
                 if swapped:
@@ -1133,7 +1162,6 @@ def compute_history(db_path: str,
                 s_meta = meta_
                 s_idx += 1
 
-            # Базовые фильтры
             status    = t_meta.get("status", "unknown")
             sets_json = t_meta.get("sets_json")
             game_home = t_meta.get("game_home")
@@ -1145,9 +1173,6 @@ def compute_history(db_path: str,
             if tb1 is None and tb2 is None: continue
             if sb1 is None and sb2 is None: continue
 
-            # ── FRESHNESS через heartbeat ────────────────────────────────────
-            # Используем последний heartbeat ≤ ts, а не ts последней строки коэфа.
-            # Это правильно разделяет «коэф стабилен» от «источник молчит».
             last_t_hb = _last_hb_before(t_hb_list, ts)
             last_s_hb = _last_hb_before(s_hb_list, ts)
             thrill_age = ts - last_t_hb if last_t_hb > 0 else freshness_sec + 1
@@ -1156,14 +1181,11 @@ def compute_history(db_path: str,
             if thrill_age > freshness_sec or sharp_age > freshness_sec:
                 if pipeline: pipeline = None
                 continue
-            # ─────────────────────────────────────────────────────────────────
 
-            # Sharp betting_enabled
             if not s_meta.get("betting", 1):
                 if pipeline: pipeline = None
                 continue
 
-            # Crossed market (lay ≤ back — стакан перестраивается)
             if sb1 is not None and sl1 is not None and sl1 <= sb1:
                 if pipeline: pipeline = None
                 continue
@@ -1171,14 +1193,12 @@ def compute_history(db_path: str,
                 if pipeline: pipeline = None
                 continue
 
-            # Thrill max odds
             tb1_u = tb1 if (tb1 is None or tb1 <= max_thrill_odds) else None
             tb2_u = tb2 if (tb2 is None or tb2 <= max_thrill_odds) else None
             if tb1_u is None and tb2_u is None:
                 if pipeline: pipeline = None
                 continue
 
-            # Arb calculation
             arbs    = _calc_arbs(tb1_u, tb2_u, sb1, sl1, sb2, sl2)
             best_v  = _best_arb(arbs)
             has_arb = best_v is not None and best_v >= min_arb
@@ -1253,7 +1273,6 @@ def compute_history(db_path: str,
                     cooldown_until = ts + cooldown
                     pipeline = None
 
-        # End of data
         if pipeline is not None and pipeline["phase"] == "tracking":
             if (_best_arb(pipeline["max_arbs"]) is not None and
                     _best_arb(pipeline["max_arbs"]) > 0):
@@ -1788,7 +1807,6 @@ if __name__ == "__main__":
     thrill_col = ThrillCollector(writer, hb)
     sharp_col  = SharpCollector(writer, hb)
 
-    # Фоновая очистка старых данных
     if DB_TTL_SEC > 0:
         PruneThread(DB_PATH, writer).start()
         log.info("PruneThread: TTL=%.1fh, interval=%.0fs", DB_TTL_SEC / 3600, PRUNE_EVERY)
