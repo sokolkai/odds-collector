@@ -189,8 +189,7 @@ function renderParams(){
       ${PI('limit','Limit',p.limit,'','1')}
     </div>
     <button class="reload-btn" onclick="reload()">&#8635; Recalculate</button>
-    <button class="reset-btn" onclick="resetP()">&#8634; Reset</button>
-    <button class="reset-btn" onclick="exportCSV()" id="csv-btn" style="display:none">&#8595; CSV</button>
+    <button class="reset-btn" onclick="exportCSV()">&#8595; CSV</button>
     <span id="spinner" style="color:var(--tx3);font-size:11px;display:none">&#8987;</span>
   </div>`;
 }
@@ -216,7 +215,6 @@ function render(){
       <span style="color:var(--dim)">${stats.computed_in_ms||0}ms</span>
     </div>`;
   }
-  document.getElementById('csv-btn')&&(document.getElementById('csv-btn').style.display=hist.length?'':'none');
   h+=renderParams();
   if(!S.data){
     h+='<div class="empty">Loading...</div>';
@@ -261,11 +259,6 @@ function TT(){
   document.body.classList.toggle('light');
   try{localStorage.setItem('arb_t',S.theme);}catch(e){}
   render();
-}
-function resetP(){
-  S.params=Object.assign({},_DEF);
-  try{localStorage.removeItem('arb_hp');}catch(e){}
-  reload();
 }
 function exportCSV(){
   if(!S.data||!S.data.history||!S.data.history.length) return;
