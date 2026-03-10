@@ -139,9 +139,9 @@ function phBadge(ph){
 }
 
 function buildRow(entry){
-  const m=entry.snap,fs=entry.frozen_sharp||{},arbs=entry.max_arbs||[null,null,null,null];
+  const m=entry.snap,fs=entry.frozen_sharp||{},arbs=entry.arbs||[null,null,null,null];
   const sc=fmtScore(m.score);
-  const profit=arbs.reduce((b,v)=>v!=null&&(b===null||v>b)?v:b,null);
+  const profit=entry.profit!=null?entry.profit:null;
   const isBL=entry.arb_type_idx===2||entry.arb_type_idx===3;
   const typeBadge=`<span class="badge ${isBL?'badge-bl':'badge-bb'}">${E(entry.arb_type||'')}</span>`;
   const scWarn=entry.score_changed?'<span class="badge badge-warn" title="Score changed during window">sc!</span> ':'';

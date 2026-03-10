@@ -433,8 +433,8 @@ def compute_history(db_path: str,
                     entry = pipeline
                     if (entry["phase"] == "tracking"
                             and entry.get("frozen_sharp")
-                            and _best_arb(entry["min_arbs"]) is not None
-                            and _best_arb(entry["min_arbs"]) > 0):
+                            and entry.get("min_profit") is not None
+                            and entry["min_profit"] > 0):
                         history_entries.append(
                             _make_entry(entry, ts, th_eid, sh_eid, t_meta,
                                         thrill_age, sharp_age))
@@ -443,19 +443,25 @@ def compute_history(db_path: str,
                 continue
 
             if pipeline is None:
+                # Фиксируем тип арбитража в момент обнаружения
+                arb_type_idx = 0
+                arb_type_val = None
+                for _i, _v in enumerate(arbs):
+                    if _v is not None and (arb_type_val is None or _v > arb_type_val):
+                        arb_type_val = _v
+                        arb_type_idx = _i
                 pipeline = {
                     "detected_ts":        ts,
                     "phase":              "waiting",
                     "frozen_sharp":       None,
-                    "min_arbs":           [None, None, None, None],
+                    "arb_type_idx":       arb_type_idx,
+                    "min_profit":         None,
+                    "min_arbs":           None,
                     "min_snap":           None,
                     "detected_sets_json": sets_json,
                     "last_thrill_age":    thrill_age,
                     "last_sharp_age":     sharp_age,
                 }
-                pipeline["min_snap"] = _snap(ts, t_meta, tb1_u, tb2_u,
-                                              sb1, sl1, sb2, sl2,
-                                              arbs, sets_json, game_home, game_away, server)
                 continue
 
             elapsed = ts - pipeline["detected_ts"]
@@ -477,18 +483,19 @@ def compute_history(db_path: str,
                     arbs_f = _calc_arbs(tb1_u, tb2_u,
                                         fs.get("p1_back"), fs.get("p1_lay"),
                                         fs.get("p2_back"), fs.get("p2_lay"))
-                    if (_best_arb(arbs_f) is not None and
-                            (_best_arb(pipeline["min_arbs"]) is None or
-                             _best_arb(arbs_f) < _best_arb(pipeline["min_arbs"]))):
-                        pipeline["min_arbs"] = arbs_f
-                        pipeline["min_snap"] = _snap(ts, t_meta, tb1_u, tb2_u,
-                                                      sb1, sl1, sb2, sl2,
-                                                      arbs_f, sets_json,
-                                                      game_home, game_away, server)
+                    profit_f = arbs_f[pipeline["arb_type_idx"]]
+                    if (profit_f is not None and
+                            (pipeline["min_profit"] is None or profit_f < pipeline["min_profit"])):
+                        pipeline["min_profit"] = profit_f
+                        pipeline["min_arbs"]   = arbs_f
+                        pipeline["min_snap"]   = _snap(ts, t_meta, tb1_u, tb2_u,
+                                                       sb1, sl1, sb2, sl2,
+                                                       arbs_f, sets_json,
+                                                       game_home, game_away, server)
 
                 if elapsed >= window_end:
-                    if (_best_arb(pipeline["min_arbs"]) is not None and
-                            _best_arb(pipeline["min_arbs"]) > 0):
+                    if (pipeline.get("min_profit") is not None and
+                            pipeline["min_profit"] > 0):
                         history_entries.append(
                             _make_entry(pipeline, ts, th_eid, sh_eid, t_meta,
                                         thrill_age, sharp_age))
@@ -496,8 +503,8 @@ def compute_history(db_path: str,
                     pipeline = None
 
         if pipeline is not None and pipeline["phase"] == "tracking":
-            if (_best_arb(pipeline["min_arbs"]) is not None and
-                    _best_arb(pipeline["min_arbs"]) > 0):
+            if (pipeline.get("min_profit") is not None and
+                    pipeline["min_profit"] > 0):
                 last_ts = all_ts[-1] if all_ts else 0
                 history_entries.append(
                     _make_entry(pipeline, last_ts, th_eid, sh_eid, t_meta,
@@ -535,24 +542,19 @@ def _snap(ts, t_meta, tb1, tb2, sb1, sl1, sb2, sl2,
 
 def _make_entry(pipeline, recorded_ts, th_eid, sh_eid, t_meta,
                 thrill_age: float, sharp_age: float):
-    arbs = pipeline["min_arbs"]
-    best_idx = 0
-    best_val = None
-    for i, v in enumerate(arbs):
-        if v is not None and (best_val is None or v > best_val):
-            best_val = v
-            best_idx = i
+    arb_type_idx = pipeline.get("arb_type_idx", 0)
     score_changed = (pipeline.get("detected_sets_json") is not None and
                      t_meta.get("sets_json") != pipeline.get("detected_sets_json"))
     return {
         "snap":           pipeline["min_snap"],
         "frozen_sharp":   pipeline["frozen_sharp"],
-        "max_arbs":       arbs,
+        "arbs":           pipeline.get("min_arbs") or [None, None, None, None],
+        "profit":         pipeline.get("min_profit"),
         "recorded_ts":    recorded_ts,
         "thrill_age":     round(thrill_age, 1),
         "sharp_age":      round(sharp_age, 1),
-        "arb_type":       _ARB_LABELS[best_idx],
-        "arb_type_idx":   best_idx,
+        "arb_type":       _ARB_LABELS[arb_type_idx],
+        "arb_type_idx":   arb_type_idx,
         "score_changed":  score_changed,
         "th_event_id":    th_eid,
         "sh_event_id":    sh_eid,
