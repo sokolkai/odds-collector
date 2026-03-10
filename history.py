@@ -443,7 +443,7 @@ def compute_history(db_path: str,
                 continue
 
             if pipeline is None:
-                # Фиксируем тип арбитража в момент обнаружения
+                # Фиксируем лучший тип арбитража в момент первого обнаружения
                 arb_type_idx = 0
                 arb_type_val = None
                 for _i, _v in enumerate(arbs):
@@ -542,13 +542,14 @@ def _snap(ts, t_meta, tb1, tb2, sb1, sl1, sb2, sl2,
 
 def _make_entry(pipeline, recorded_ts, th_eid, sh_eid, t_meta,
                 thrill_age: float, sharp_age: float):
+    arbs = pipeline.get("min_arbs") or [None, None, None, None]
     arb_type_idx = pipeline.get("arb_type_idx", 0)
     score_changed = (pipeline.get("detected_sets_json") is not None and
                      t_meta.get("sets_json") != pipeline.get("detected_sets_json"))
     return {
         "snap":           pipeline["min_snap"],
         "frozen_sharp":   pipeline["frozen_sharp"],
-        "arbs":           pipeline.get("min_arbs") or [None, None, None, None],
+        "arbs":           arbs,
         "profit":         pipeline.get("min_profit"),
         "recorded_ts":    recorded_ts,
         "thrill_age":     round(thrill_age, 1),
