@@ -45,9 +45,7 @@ _HISTORY_HTML = r"""<!DOCTYPE html>
   .arb.pos{color:var(--green);background:rgba(0,255,135,.09);}
   .arb.neg{color:var(--dim);}
   .arb.near{color:var(--yellow);}
-  .best-arb{font-weight:700;font-size:14px;font-variant-numeric:tabular-nums;
-    padding:3px 7px;border-radius:4px;color:var(--green);background:rgba(0,255,135,.1);
-    border:1px solid rgba(0,255,135,.2);}
+
   .ph-strip{display:flex;align-items:baseline;gap:5px;margin-top:3px;padding-top:3px;border-top:1px solid var(--border2);}
   .ph-lbl{font-size:10px;font-weight:700;}
   .ph-BREAK_POINT{color:#f87171;} .ph-TIEBREAK{color:#818cf8;}
@@ -141,7 +139,6 @@ function phBadge(ph){
 function buildRow(entry){
   const m=entry.snap,fs=entry.frozen_sharp||{},arbs=entry.arbs||[null,null,null,null];
   const sc=fmtScore(m.score);
-  const profit=entry.profit!=null?entry.profit:null;
   const isBL=entry.arb_type_idx===2||entry.arb_type_idx===3;
   const typeBadge=`<span class="badge ${isBL?'badge-bl':'badge-bb'}">${E(entry.arb_type||'')}</span>`;
   const scWarn=entry.score_changed?'<span class="badge badge-warn" title="Score changed during window">sc!</span> ':'';
@@ -162,7 +159,6 @@ function buildRow(entry){
   h+='<td class="sp"></td>';
   for(let i=0;i<4;i++) h+=`<td><span class="${arbCls(arbs[i])}">${arbTxt(arbs[i])}</span></td>`;
   h+='<td class="sp"></td>';
-  h+=`<td><span class="best-arb">${arbTxt(profit)}</span></td>`;
   h+=`<td>${scWarn}${typeBadge}</td>`;
   h+=`<td><span class="${AgeCls(ta)}">T:${ta!=null?ta+'s':'--'}</span><br><span class="${AgeCls(sa)}">S:${sa!=null?sa+'s':'--'}</span></td>`;
   h+=`<td style="color:var(--tx3);font-variant-numeric:tabular-nums">${Ago(entry.recorded_ts)}</td>`;
@@ -238,7 +234,6 @@ function render(){
       <th style="color:var(--blue)" title="Back T.P1 + Lay S.P1">bl1</th>
       <th style="color:var(--blue)" title="Back T.P2 + Lay S.P2">bl2</th>
       <th class="sp"></th>
-      <th style="color:var(--green)">Profit</th>
       <th>Type</th><th>Ages</th><th>Ago</th>
     </tr></thead><tbody>`;
     for(const [tour,rows] of Object.entries(byTour).sort((a,b)=>a[0].localeCompare(b[0]))){
