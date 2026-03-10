@@ -42,7 +42,7 @@ def _bl(back, lay):
 def _calc_arbs(tb1, tb2, sb1, sl1, sb2, sl2):
     return [
         _bb(tb1, sb2),
-        _bb(sb1, tb2),
+        _bb(tb2, sb1),
         _bl(tb1, sl1),
         _bl(tb2, sl2),
     ]
@@ -209,7 +209,6 @@ def compute_history(db_path: str,
                     window_end:      float = 20.0,
                     cooldown:        float = 60.0,
                     freshness_sec:   float = 45.0,
-                    lag_sec:         float = 2.0,
                     max_thrill_odds: float = 30.0,
                     lookback_hours:  float = 0.0) -> list:
     """
@@ -270,14 +269,15 @@ def compute_history(db_path: str,
     thrill_tl: Dict[str, list] = {}
     for eid, ts_dict in th_changes.items():
         p1_back = p2_back = None
+        p1_ts   = p2_ts   = 0.0   # когда каждый исход последний раз обновлялся
         tl = []
         for ts in sorted(ts_dict):
             slot = ts_dict[ts]
-            if "4" in slot: p1_back = slot["4"]
-            if "5" in slot: p2_back = slot["5"]
+            if "4" in slot: p1_back = slot["4"]; p1_ts = ts
+            if "5" in slot: p2_back = slot["5"]; p2_ts = ts
             meta = {k: slot[k] for k in ("p1","p2","tname","status","sets_json",
                                           "game_home","game_away","server") if k in slot}
-            tl.append((ts, p1_back, p2_back, dict(meta)))
+            tl.append((ts, p1_back, p2_back, p1_ts, p2_ts, dict(meta)))
         thrill_tl[eid] = tl
 
     # ── 3. Load Sharp timeline ───────────────────────────────────────────────
@@ -361,6 +361,7 @@ def compute_history(db_path: str,
 
         t_idx = s_idx = 0
         tb1 = tb2 = None
+        tb1_ts = tb2_ts = 0.0
         sb1 = sl1 = sb2 = sl2 = None
         t_meta: dict = {}
         s_meta: dict = {}
@@ -370,12 +371,13 @@ def compute_history(db_path: str,
 
         for ts in all_ts:
             while t_idx < len(t_tl) and t_tl[t_idx][0] <= ts:
-                _, tb1_, tb2_, meta_ = t_tl[t_idx]
+                _, tb1_, tb2_, p1_ts_, p2_ts_, meta_ = t_tl[t_idx]
                 tb1, tb2 = tb1_, tb2_
+                tb1_ts, tb2_ts = p1_ts_, p2_ts_
                 t_meta = meta_
                 t_idx += 1
 
-            while s_idx < len(s_tl) and s_tl[s_idx][0] <= ts - lag_sec:
+            while s_idx < len(s_tl) and s_tl[s_idx][0] <= ts:
                 _, sb1_, sl1_, sb2_, sl2_, meta_ = s_tl[s_idx]
                 if swapped:
                     sb1, sl1, sb2, sl2 = sb2_, sl2_, sb1_, sl1_
@@ -418,6 +420,13 @@ def compute_history(db_path: str,
             tb1_u = tb1 if (tb1 is None or tb1 <= max_thrill_odds) else None
             tb2_u = tb2 if (tb2 is None or tb2 <= max_thrill_odds) else None
             if tb1_u is None and tb2_u is None:
+                if pipeline: pipeline = None
+                continue
+
+            # Проверяем, что P1 и P2 Thrill обновлялись в один и тот же момент.
+            # Если разница между последними обновлениями > freshness_sec —
+            # один из коэфов протух, пара невалидна (внутренняя вилка невозможна).
+            if tb1_u and tb2_u and abs(tb1_ts - tb2_ts) > freshness_sec:
                 if pipeline: pipeline = None
                 continue
 
@@ -576,7 +585,6 @@ def build_history_response(db_path: str, params: dict) -> dict:
             window_end      = float(params.get("window_end",     20.0)),
             cooldown        = float(params.get("cooldown",       60.0)),
             freshness_sec   = float(params.get("freshness_sec",  45.0)),
-            lag_sec         = float(params.get("lag_sec",         2.0)),
             max_thrill_odds = float(params.get("max_thrill_odds",30.0)),
             lookback_hours  = float(params.get("lookback_hours",  0.0)),
         )

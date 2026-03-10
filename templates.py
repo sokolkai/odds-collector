@@ -99,7 +99,7 @@ _HISTORY_HTML = r"""<!DOCTYPE html>
 <script>
 'use strict';
 const _DEF={min_arb:2.0,sharp_delay:3.0,window_start:15.0,window_end:20.0,
-            cooldown:60.0,freshness_sec:45.0,lag_sec:2.0,max_thrill_odds:30.0,
+            cooldown:60.0,freshness_sec:45.0,max_thrill_odds:30.0,
             lookback_hours:0,limit:100};
 let S={data:null,theme:'dark',params:Object.assign({},_DEF)};
 try{if(localStorage.getItem('arb_t')==='light'){S.theme='light';document.body.classList.add('light');}}catch(e){}
@@ -181,7 +181,6 @@ function renderParams(){
     <span class="ptitle">Quality</span>
     <div class="pgrp">
       ${PI('freshness_sec','Freshness',p.freshness_sec,'s')}
-      ${PI('lag_sec','Lag',p.lag_sec,'s','0.5')}
       ${PI('max_thrill_odds','MaxOdds',p.max_thrill_odds,'x','1')}
     </div>
     <div class="pgrp">
