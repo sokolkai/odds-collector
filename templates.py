@@ -190,6 +190,7 @@ function renderParams(){
     </div>
     <button class="reload-btn" onclick="reload()">&#8635; Recalculate</button>
     <button class="reset-btn" onclick="resetP()">&#8634; Reset</button>
+    <button class="reset-btn" onclick="exportCSV()" id="csv-btn" style="display:none">&#8595; CSV</button>
     <span id="spinner" style="color:var(--tx3);font-size:11px;display:none">&#8987;</span>
   </div>`;
 }
@@ -215,6 +216,7 @@ function render(){
       <span style="color:var(--dim)">${stats.computed_in_ms||0}ms</span>
     </div>`;
   }
+  document.getElementById('csv-btn')&&(document.getElementById('csv-btn').style.display=hist.length?'':'none');
   h+=renderParams();
   if(!S.data){
     h+='<div class="empty">Loading...</div>';
@@ -265,6 +267,57 @@ function resetP(){
   try{localStorage.removeItem('arb_hp');}catch(e){}
   reload();
 }
+function exportCSV(){
+  if(!S.data||!S.data.history||!S.data.history.length) return;
+  const rows=S.data.history;
+  const cols=['recorded_ago','tournament','player1','player2','score','phase',
+              'thrill_p1_back','thrill_p2_back',
+              'sharp_p1_back','sharp_p1_lay','sharp_p2_back','sharp_p2_lay',
+              'bb1','bb2','bl1','bl2',
+              'arb_type','thrill_age','sharp_age','score_changed',
+              'th_event_id','sh_event_id'];
+  function fmtScore(sc){
+    if(!sc||!(sc.period_scores||[]).length) return '';
+    const ps=sc.period_scores;
+    const p1=ps.map(p=>p.home_score).join(' ');
+    const p2=ps.map(p=>p.away_score).join(' ');
+    const hg=sc.home_gamescore!=null?sc.home_gamescore:'';
+    const ag=sc.away_gamescore!=null?sc.away_gamescore:'';
+    return `${p1} (${hg}) / ${p2} (${ag})`;
+  }
+  function q(v){
+    if(v==null) return '';
+    const s=String(v);
+    return s.includes(',')||s.includes('"')||s.includes('\n')?`"${s.replace(/"/g,'""')}"`:s;
+  }
+  const lines=[cols.join(',')];
+  rows.forEach(e=>{
+    const m=e.snap,fs=e.frozen_sharp||{},arbs=e.arbs||[null,null,null,null];
+    const ago=Math.round(Date.now()/1000-e.recorded_ts);
+    const phase=m.phase?m.phase.label||m.phase.phase||'':'';
+    lines.push([
+      ago+'s ago',
+      m.tournament,m.player1,m.player2,
+      fmtScore(m.score),phase,
+      m.thrill_p1_back,m.thrill_p2_back,
+      fs.p1_back,fs.p1_lay,fs.p2_back,fs.p2_lay,
+      arbs[0]!=null?arbs[0].toFixed(2):null,
+      arbs[1]!=null?arbs[1].toFixed(2):null,
+      arbs[2]!=null?arbs[2].toFixed(2):null,
+      arbs[3]!=null?arbs[3].toFixed(2):null,
+      e.arb_type,e.thrill_age,e.sharp_age,
+      e.score_changed?1:0,
+      e.th_event_id,e.sh_event_id
+    ].map(q).join(','));
+  });
+  const blob=new Blob([lines.join('\n')],{type:'text/csv'});
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(blob);
+  const d=new Date().toISOString().slice(0,16).replace('T','_').replace(':','-');
+  a.download=`arb_history_${d}.csv`;
+  a.click();
+}
+
 function reload(){
   try{localStorage.setItem('arb_hp',JSON.stringify(S.params));}catch(e){}
   document.querySelectorAll('#spinner').forEach(el=>el.style.display='inline');
