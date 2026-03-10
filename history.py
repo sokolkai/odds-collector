@@ -325,7 +325,7 @@ def compute_history(db_path: str,
     th_names: Dict[str, Tuple[str, str]] = {}
     for eid, tl in thrill_tl.items():
         if tl:
-            meta = tl[-1][3]
+            meta = tl[-1][5]
             th_names[eid] = (meta.get("p1",""), meta.get("p2",""))
 
     sh_names: Dict[str, Tuple[str, str]] = {}
