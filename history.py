@@ -1,6 +1,21 @@
 """
 История арбитража: матчинг имён, расчёт арба, обнаружение фазы,
 воспроизведение таймлайна из БД.
+
+ИСПРАВЛЕНИЯ (аудит):
+  FIX 1: Убран check abs(tb1_ts - tb2_ts) > freshness_sec.
+         Thrill обновляет outcomes асинхронно — 23% апдейтов одиночные.
+         Heartbeat уже доказывает liveness источника.
+  FIX 2: Pipeline больше НЕ требует has_arb=True на каждом тике.
+         Waiting фаза: просто ждёт sharp_delay, не проверяя текущий арб.
+         Tracking фаза: вычисляет profit по frozen sharp, не зависит
+         от текущего has_arb. Убивается только при невалидных данных
+         (stale, betting off, bad spread).
+  FIX 3: Убран continue после создания pipeline — первый тик может
+         сразу перейти в tracking если elapsed >= sharp_delay.
+  FIX 4: Tracking фаза начинает мерить min_profit сразу (с elapsed=0),
+         а не только после window_start. window_start/window_end
+         теперь определяют только когда pipeline может быть закрыт.
 """
 from __future__ import annotations
 import bisect
@@ -201,6 +216,29 @@ _ARB_LABELS = [
 ]
 
 
+def _data_valid(thrill_age, sharp_age, freshness_sec,
+                s_meta, sb1, sl1, sb2, sl2,
+                tb1, tb2, max_thrill_odds):
+    """Проверяет, что данные свежие и валидные (без проверки арба)."""
+    # Свежесть
+    if thrill_age > freshness_sec or sharp_age > freshness_sec:
+        return False
+    # Betting
+    if not s_meta.get("betting", 1):
+        return False
+    # Spread validity
+    if sb1 is not None and sl1 is not None and sl1 <= sb1:
+        return False
+    if sb2 is not None and sl2 is not None and sl2 <= sb2:
+        return False
+    # Thrill odds cap
+    tb1_ok = tb1 is not None and tb1 <= max_thrill_odds
+    tb2_ok = tb2 is not None and tb2 <= max_thrill_odds
+    if not tb1_ok and not tb2_ok:
+        return False
+    return True
+
+
 def compute_history(db_path: str,
                     limit:           int   = 100,
                     min_arb:         float = 2.0,
@@ -211,13 +249,6 @@ def compute_history(db_path: str,
                     freshness_sec:   float = 45.0,
                     max_thrill_odds: float = 30.0,
                     lookback_hours:  float = 0.0) -> list:
-    """
-    Воспроизводит данные из DB и находит арбитражные возможности.
-
-    FIX F: убран market_id='1' из WHERE clause Thrill timeline —
-    данных с ним больше нет (исключён в ThrillCollector._emit()).
-    Ускоряет загрузку при больших БД.
-    """
     conn = sqlite3.connect(db_path, check_same_thread=False)
     cur  = conn.cursor()
 
@@ -244,7 +275,6 @@ def compute_history(db_path: str,
         return hb_list[idx] if idx >= 0 else 0.0
 
     # ── 2. Load Thrill timeline ──────────────────────────────────────────────
-    # FIX F: market_id='186' только — убран '1' (данных с ним больше нет).
     cur.execute(f"""
         SELECT ts, event_id, player1, player2, tournament_name, status,
                outcome_id, odds, sets_json, game_home, game_away, server
@@ -269,15 +299,14 @@ def compute_history(db_path: str,
     thrill_tl: Dict[str, list] = {}
     for eid, ts_dict in th_changes.items():
         p1_back = p2_back = None
-        p1_ts   = p2_ts   = 0.0   # когда каждый исход последний раз обновлялся
         tl = []
         for ts in sorted(ts_dict):
             slot = ts_dict[ts]
-            if "4" in slot: p1_back = slot["4"]; p1_ts = ts
-            if "5" in slot: p2_back = slot["5"]; p2_ts = ts
+            if "4" in slot: p1_back = slot["4"]
+            if "5" in slot: p2_back = slot["5"]
             meta = {k: slot[k] for k in ("p1","p2","tname","status","sets_json",
                                           "game_home","game_away","server") if k in slot}
-            tl.append((ts, p1_back, p2_back, p1_ts, p2_ts, dict(meta)))
+            tl.append((ts, p1_back, p2_back, dict(meta)))
         thrill_tl[eid] = tl
 
     # ── 3. Load Sharp timeline ───────────────────────────────────────────────
@@ -325,7 +354,7 @@ def compute_history(db_path: str,
     th_names: Dict[str, Tuple[str, str]] = {}
     for eid, tl in thrill_tl.items():
         if tl:
-            meta = tl[-1][5]
+            meta = tl[-1][3]
             th_names[eid] = (meta.get("p1",""), meta.get("p2",""))
 
     sh_names: Dict[str, Tuple[str, str]] = {}
@@ -347,7 +376,7 @@ def compute_history(db_path: str,
                 used_sh.add(sh_eid)
                 break
 
-    # ── 5. Simulate HistoryTracker for each matched pair ──────────────────────
+    # ── 5. Simulate for each matched pair ─────────────────────────────────────
     history_entries: list = []
 
     for th_eid, sh_eid, swapped in matched:
@@ -361,7 +390,6 @@ def compute_history(db_path: str,
 
         t_idx = s_idx = 0
         tb1 = tb2 = None
-        tb1_ts = tb2_ts = 0.0
         sb1 = sl1 = sb2 = sl2 = None
         t_meta: dict = {}
         s_meta: dict = {}
@@ -371,9 +399,8 @@ def compute_history(db_path: str,
 
         for ts in all_ts:
             while t_idx < len(t_tl) and t_tl[t_idx][0] <= ts:
-                _, tb1_, tb2_, p1_ts_, p2_ts_, meta_ = t_tl[t_idx]
+                _, tb1_, tb2_, meta_ = t_tl[t_idx]
                 tb1, tb2 = tb1_, tb2_
-                tb1_ts, tb2_ts = p1_ts_, p2_ts_
                 t_meta = meta_
                 t_idx += 1
 
@@ -392,44 +419,27 @@ def compute_history(db_path: str,
             game_away = t_meta.get("game_away")
             server    = t_meta.get("server")
 
+            # Базовые проверки: live матч с данными
             if status != "live": continue
             if not sets_json or sets_json == "[]": continue
             if tb1 is None and tb2 is None: continue
             if sb1 is None and sb2 is None: continue
 
+            # Freshness
             last_t_hb = _last_hb_before(t_hb_list, ts)
             last_s_hb = _last_hb_before(s_hb_list, ts)
             thrill_age = ts - last_t_hb if last_t_hb > 0 else freshness_sec + 1
             sharp_age  = ts - last_s_hb if last_s_hb > 0 else freshness_sec + 1
 
-            if thrill_age > freshness_sec or sharp_age > freshness_sec:
-                if pipeline: pipeline = None
-                continue
+            # Thrill odds с учётом cap
+            tb1_u = tb1 if (tb1 is not None and tb1 <= max_thrill_odds) else None
+            tb2_u = tb2 if (tb2 is not None and tb2 <= max_thrill_odds) else None
 
-            if not s_meta.get("betting", 1):
-                if pipeline: pipeline = None
-                continue
+            valid = _data_valid(thrill_age, sharp_age, freshness_sec,
+                                s_meta, sb1, sl1, sb2, sl2,
+                                tb1, tb2, max_thrill_odds)
 
-            if sb1 is not None and sl1 is not None and sl1 <= sb1:
-                if pipeline: pipeline = None
-                continue
-            if sb2 is not None and sl2 is not None and sl2 <= sb2:
-                if pipeline: pipeline = None
-                continue
-
-            tb1_u = tb1 if (tb1 is None or tb1 <= max_thrill_odds) else None
-            tb2_u = tb2 if (tb2 is None or tb2 <= max_thrill_odds) else None
-            if tb1_u is None and tb2_u is None:
-                if pipeline: pipeline = None
-                continue
-
-            # Проверяем, что P1 и P2 Thrill обновлялись в один и тот же момент.
-            # Если разница между последними обновлениями > freshness_sec —
-            # один из коэфов протух, пара невалидна (внутренняя вилка невозможна).
-            if tb1_u and tb2_u and abs(tb1_ts - tb2_ts) > freshness_sec:
-                if pipeline: pipeline = None
-                continue
-
+            # ── FIX 2: Текущий арб проверяется только для СОЗДАНИЯ pipeline ──
             arbs    = _calc_arbs(tb1_u, tb2_u, sb1, sl1, sb2, sl2)
             best_v  = _best_arb(arbs)
             has_arb = best_v is not None and best_v >= min_arb
@@ -437,22 +447,11 @@ def compute_history(db_path: str,
             if ts < cooldown_until:
                 continue
 
-            if not has_arb:
-                if pipeline is not None:
-                    entry = pipeline
-                    if (entry["phase"] == "tracking"
-                            and entry.get("frozen_sharp")
-                            and entry.get("min_profit") is not None
-                            and entry["min_profit"] > 0):
-                        history_entries.append(
-                            _make_entry(entry, ts, th_eid, sh_eid, t_meta,
-                                        thrill_age, sharp_age))
-                        cooldown_until = ts + cooldown
-                    pipeline = None
-                continue
-
+            # ── Pipeline не существует ────────────────────────────────────────
             if pipeline is None:
-                # Фиксируем лучший тип арбитража в момент первого обнаружения
+                # Создаём только если данные валидны И арб есть
+                if not valid or not has_arb:
+                    continue
                 arb_type_idx = 0
                 arb_type_val = None
                 for _i, _v in enumerate(arbs):
@@ -471,10 +470,26 @@ def compute_history(db_path: str,
                     "last_thrill_age":    thrill_age,
                     "last_sharp_age":     sharp_age,
                 }
-                continue
+                # FIX 3: не делаем continue — позволяем сразу перейти в tracking
 
+            # ── Pipeline существует ───────────────────────────────────────────
             elapsed = ts - pipeline["detected_ts"]
 
+            # Невалидные данные убивают pipeline
+            if not valid:
+                # Но если tracking и есть результат — эмитим
+                if (pipeline["phase"] == "tracking"
+                        and pipeline.get("frozen_sharp")
+                        and pipeline.get("min_profit") is not None
+                        and pipeline["min_profit"] > 0):
+                    history_entries.append(
+                        _make_entry(pipeline, ts, th_eid, sh_eid, t_meta,
+                                    thrill_age, sharp_age))
+                    cooldown_until = ts + cooldown
+                pipeline = None
+                continue
+
+            # ── Waiting phase ─────────────────────────────────────────────────
             if pipeline["phase"] == "waiting":
                 if elapsed >= sharp_delay:
                     pipeline["phase"]        = "tracking"
@@ -483,24 +498,25 @@ def compute_history(db_path: str,
                 else:
                     continue
 
+            # ── Tracking phase ────────────────────────────────────────────────
             if pipeline["phase"] == "tracking" and pipeline["frozen_sharp"]:
                 pipeline["last_thrill_age"] = thrill_age
                 pipeline["last_sharp_age"]  = sharp_age
 
-                if elapsed >= window_start:
-                    fs = pipeline["frozen_sharp"]
-                    arbs_f = _calc_arbs(tb1_u, tb2_u,
-                                        fs.get("p1_back"), fs.get("p1_lay"),
-                                        fs.get("p2_back"), fs.get("p2_lay"))
-                    profit_f = arbs_f[pipeline["arb_type_idx"]]
-                    if (profit_f is not None and
-                            (pipeline["min_profit"] is None or profit_f < pipeline["min_profit"])):
-                        pipeline["min_profit"] = profit_f
-                        pipeline["min_arbs"]   = arbs_f
-                        pipeline["min_snap"]   = _snap(ts, t_meta, tb1_u, tb2_u,
-                                                       sb1, sl1, sb2, sl2,
-                                                       arbs_f, sets_json,
-                                                       game_home, game_away, server)
+                # FIX 4: Вычисляем profit по frozen sharp на КАЖДОМ тике
+                fs = pipeline["frozen_sharp"]
+                arbs_f = _calc_arbs(tb1_u, tb2_u,
+                                    fs.get("p1_back"), fs.get("p1_lay"),
+                                    fs.get("p2_back"), fs.get("p2_lay"))
+                profit_f = arbs_f[pipeline["arb_type_idx"]]
+                if (profit_f is not None and
+                        (pipeline["min_profit"] is None or profit_f < pipeline["min_profit"])):
+                    pipeline["min_profit"] = profit_f
+                    pipeline["min_arbs"]   = arbs_f
+                    pipeline["min_snap"]   = _snap(ts, t_meta, tb1_u, tb2_u,
+                                                   sb1, sl1, sb2, sl2,
+                                                   arbs_f, sets_json,
+                                                   game_home, game_away, server)
 
                 if elapsed >= window_end:
                     if (pipeline.get("min_profit") is not None and
@@ -511,6 +527,7 @@ def compute_history(db_path: str,
                     cooldown_until = ts + cooldown
                     pipeline = None
 
+        # Закрытие оставшегося pipeline в конце
         if pipeline is not None and pipeline["phase"] == "tracking":
             if (pipeline.get("min_profit") is not None and
                     pipeline["min_profit"] > 0):
