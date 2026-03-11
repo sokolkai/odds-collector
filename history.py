@@ -1,23 +1,35 @@
 """
-История арбитража: матчинг имён, расчёт арба, обнаружение фазы,
-воспроизведение таймлайна из БД.
+История арбитража: матчинг имён, расчёт арба, воспроизведение таймлайна из БД.
 
-ИНВАРИАНТ ПАКЕТА (ключевое изменение):
-  Thrill: P1_back и P2_back должны присутствовать в ОДНОМ ts-слоте.
-          Если в пакете пришёл только один исход — тик пропускается.
-  Sharp:  p1_back, p1_lay, p2_back, p2_lay — все четыре в ОДНОМ ts-слоте.
-          Неполный пакет (только один runner или только back/lay) — пропускается.
+ИСПРАВЛЕНИЯ (относительно предыдущей версии):
+─────────────────────────────────────────────
+1. CARRY-FORWARD вместо инварианта пакета.
+   Thrill и Sharp шлют дельта-обновления: один исход / один runner за раз.
+   Старый «инвариант пакета» выбрасывал 20% Thrill-тиков и 55% Sharp-тиков.
+   Теперь несём последнее известное значение по каждому полю независимо —
+   точно так же, как это делает RunnerOdds.set_back/set_lay в сканере.
 
-  Carry-forward применяется только к ПОЛНЫМ состояниям, не к отдельным полям.
-  Это исключает ситуацию, когда P1 от T1 и P2 от T0 образуют
-  «невозможную» вилку внутри одной конторы.
+2. SHARP LAG-БУФЕР (аналог SharpBuffer в сканере).
+   Новое значение Sharp-коэффициента принимается как «стабильное» только
+   если оно держится ≥ sharp_lag секунд без изменений.
+   Защищает от ложных вилок на мгновенных флуктуациях стакана.
 
-Pipeline-фазы:
-  None → waiting (sharp_delay сек) → tracking (до window_end) → закрытие.
-  В tracking фиксируем Sharp и ищем минимальный profit за окно.
-  Записывается только если min_profit > 0.
+3. THRILL STALE GUARD (аналог _THRILL_STALE = 180 s в сканере).
+   Если heartbeat Thrill был > max_thrill_stale секунд назад — коэффициенты
+   сбрасываются (None). Это исключает вилки типа Nava/Mmoh (+100%) и
+   Hayasaka/Kuramochi (~50%), где THRILL завис на старых котировках.
+
+4. FRESHNESS по heartbeat теперь применяется к ОБОИМ источникам независимо,
+   без объединённого флага valid — точно как в engine/core.py.
+
+5. SPREAD GUARD для Sharp вынесен в build-фазу: пакет с lay≤back пропускается
+   по каждому полю независимо (back/lay могут прийти в разных тиках).
+
+6. window_start убран (не использовался в расчёте — только window_end).
+   Profit берётся как МИНИМУМ за [0, window_end], что консервативно.
 """
 from __future__ import annotations
+
 import bisect
 import json
 import logging
@@ -38,13 +50,17 @@ _ARB_LABELS = [
     "T.P2↑ / S.P2 lay",
 ]
 
+# Максимальный возраст Thrill-данных: если heartbeat старше — коэффициент не используется.
+# Аналог _THRILL_STALE = 180 в engine/core.py. Устраняет класс ошибок типа
+# Nava/Mmoh (+100%) и Hayasaka (+50%), где THRILL завис после разрыва соединения.
+_THRILL_STALE_SEC = 180.0
+
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ARB MATH
+# ARB MATH  (без изменений)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _bb(b1: Optional[float], b2: Optional[float]) -> Optional[float]:
-    """Back b1 у Thrill + Back b2 у Sharp (с комиссией Sharp)."""
     if not b1 or not b2 or b1 <= 1 or b2 <= 1:
         return None
     c  = _SHARP_COMM
@@ -55,7 +71,6 @@ def _bb(b1: Optional[float], b2: Optional[float]) -> Optional[float]:
 
 
 def _bl(back: Optional[float], lay: Optional[float]) -> Optional[float]:
-    """Back у Thrill + Lay у Sharp (с комиссией Sharp)."""
     if not back or not lay or back <= 1 or lay <= 1:
         return None
     c      = _SHARP_COMM
@@ -67,17 +82,7 @@ def _bl(back: Optional[float], lay: Optional[float]) -> Optional[float]:
     return (profit / total) * 100.0 if total > 0 else None
 
 
-def _calc_arbs(tb1: Optional[float], tb2: Optional[float],
-               sb1: Optional[float], sl1: Optional[float],
-               sb2: Optional[float], sl2: Optional[float],
-               ) -> List[Optional[float]]:
-    """
-    Четыре арб-стратегии:
-      [0] T.P1↑ / S.P2↑  — Back P1 Thrill + Back P2 Sharp
-      [1] S.P1↑ / T.P2↑  — Back P2 Thrill + Back P1 Sharp
-      [2] T.P1↑ / S.P1lay — Back P1 Thrill + Lay P1 Sharp
-      [3] T.P2↑ / S.P2lay — Back P2 Thrill + Lay P2 Sharp
-    """
+def _calc_arbs(tb1, tb2, sb1, sl1, sb2, sl2) -> List[Optional[float]]:
     return [
         _bb(tb1, sb2),
         _bb(tb2, sb1),
@@ -86,206 +91,156 @@ def _calc_arbs(tb1: Optional[float], tb2: Optional[float],
     ]
 
 
-def _best_arb(arbs: List[Optional[float]]) -> Optional[float]:
+def _best_arb(arbs) -> Optional[float]:
     valid = [v for v in arbs if v is not None and v > -900]
     return max(valid) if valid else None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# NAME MATCHING
+# NAME MATCHING  (без изменений)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _nm_norm(s: str) -> str:
+def _nm_norm(s):
     s = _ucd.normalize("NFD", s)
     return "".join(c for c in s if _ucd.category(c) != "Mn").lower().strip()
 
-
-def _nm_clean(s: str) -> str:
+def _nm_clean(s):
     return " ".join(s.replace(".", " ").split())
 
-
-_NM_SUFFIXES  = {"jr", "sr", "ii", "iii", "iv"}
+_NM_SUFFIXES  = {"jr","sr","ii","iii","iv"}
 _NM_PARTICLES = {"de","di","du","van","von","la","le","el","al","da","dos","del","den"}
 
+def _nm_strip_suf(s):
+    w = s.split()
+    while w and w[-1] in _NM_SUFFIXES: w.pop()
+    return " ".join(w) if w else s
 
-def _nm_strip_suf(surname: str) -> str:
-    words = surname.split()
-    while words and words[-1] in _NM_SUFFIXES:
-        words.pop()
-    return " ".join(words) if words else surname
-
-
-def _nm_surname_from_single(raw: str) -> str:
+def _nm_surname_from_single(raw):
     s = _nm_clean(_nm_norm(raw))
-    if "," in s:
-        return _nm_strip_suf(s.split(",")[0].strip())
+    if "," in s: return _nm_strip_suf(s.split(",")[0].strip())
     parts = s.split()
-    if not parts:
-        return s
-    if len(parts) == 1:
-        return parts[0]
-
-    def _is_lead(tok):
-        if tok in _NM_PARTICLES:
-            return False
-        t = tok.replace("-", "")
-        return len(t) == 1 and t.isalpha()
-
-    def _is_trail(tok):
-        if tok in _NM_PARTICLES:
-            return False
-        if tok in _NM_SUFFIXES:
-            return True
-        t = tok.replace("-", "")
-        return len(t) <= 2 and t.isalpha()
-
-    if _is_lead(parts[0]):
-        return " ".join(parts[1:])
+    if not parts: return s
+    if len(parts) == 1: return parts[0]
+    def _lead(t):
+        if t in _NM_PARTICLES: return False
+        return len(t.replace("-","")) == 1 and t.replace("-","").isalpha()
+    def _trail(t):
+        if t in _NM_PARTICLES: return False
+        if t in _NM_SUFFIXES: return True
+        return len(t.replace("-","")) <= 2 and t.replace("-","").isalpha()
+    if _lead(parts[0]): return " ".join(parts[1:])
     end = len(parts)
-    while end > 1 and _is_trail(parts[end - 1]):
-        end -= 1
+    while end > 1 and _trail(parts[end-1]): end -= 1
     if end < len(parts):
         r = " ".join(parts[:end])
-        if len(r) >= 2:
-            return r
+        if len(r) >= 2: return r
     return s
 
+def _nm_is_pair(name): return "/" in name or " & " in name
 
-def _nm_is_pair(name: str) -> bool:
-    return "/" in name or " & " in name
-
-
-def _nm_pair_key(name: str) -> str:
+def _nm_pair_key(name):
     sep = " & " if " & " in name else "/"
     halves = [h.strip() for h in name.split(sep, 1)]
-    surnames = sorted(_nm_surname_from_single(h).replace("-", " ") for h in halves)
-    return "+".join(surnames)
+    return "+".join(sorted(_nm_surname_from_single(h).replace("-"," ") for h in halves))
 
-
-def _extract_surname(name: str) -> str:
+def _extract_surname(name):
     name = name.strip()
-    if _nm_is_pair(name):
-        return _nm_pair_key(name)
-    return _nm_surname_from_single(_nm_norm(name)).replace("-", " ")
+    if _nm_is_pair(name): return _nm_pair_key(name)
+    return _nm_surname_from_single(_nm_norm(name)).replace("-"," ")
 
-
-def _nm_singles_match(a: str, b: str) -> bool:
-    if a == b:
-        return True
-    a_last = a.split()[-1]
-    b_last = b.split()[-1]
-    if a_last == b_last and len(a) != len(b) and len(a_last) >= 3:
-        return True
+def _nm_singles_match(a, b):
+    if a == b: return True
+    a_last, b_last = a.split()[-1], b.split()[-1]
+    if a_last == b_last and len(a) != len(b) and len(a_last) >= 3: return True
     la, lb = len(a), len(b)
     diff = abs(la - lb)
-    if diff <= 2 and min(la, lb) >= 7:
-        short = a if la <= lb else b
-        long_ = b if la <= lb else a
-        if long_.startswith(short):
-            return True
-    if diff == 1 and min(la, lb) >= 4:
-        short, long_ = (a, b) if la < lb else (b, a)
+    if diff <= 2 and min(la,lb) >= 7:
+        short, long_ = (a,b) if la<=lb else (b,a)
+        if long_.startswith(short): return True
+    if diff == 1 and min(la,lb) >= 4:
+        short, long_ = (a,b) if la<lb else (b,a)
         if not long_.startswith(short):
             for i in range(len(long_)):
-                if long_[:i] + long_[i + 1:] == short:
-                    return True
+                if long_[:i]+long_[i+1:] == short: return True
     return False
 
-
-def _nm_surnames_match(a: str, b: str) -> bool:
-    if a == b:
-        return True
+def _nm_surnames_match(a, b):
+    if a == b: return True
     ap, bp = "+" in a, "+" in b
     if ap and bp:
         pa, pb = a.split("+"), b.split("+")
-        return _nm_singles_match(pa[0], pb[0]) and _nm_singles_match(pa[1], pb[1])
-    if ap or bp:
-        return False
+        return _nm_singles_match(pa[0],pb[0]) and _nm_singles_match(pa[1],pb[1])
+    if ap or bp: return False
     return _nm_singles_match(a, b)
 
-
-def _match_pair(p1a: str, p2a: str, p1b: str, p2b: str) -> Tuple[bool, bool]:
-    """Возвращает (matched, swapped)."""
-    a1 = _extract_surname(p1a); a2 = _extract_surname(p2a)
-    b1 = _extract_surname(p1b); b2 = _extract_surname(p2b)
-    if _nm_surnames_match(a1, b1) and _nm_surnames_match(a2, b2):
-        return True, False
-    if _nm_surnames_match(a1, b2) and _nm_surnames_match(a2, b1):
-        return True, True
+def _match_pair(p1a, p2a, p1b, p2b) -> Tuple[bool, bool]:
+    a1,a2 = _extract_surname(p1a), _extract_surname(p2a)
+    b1,b2 = _extract_surname(p1b), _extract_surname(p2b)
+    if _nm_surnames_match(a1,b1) and _nm_surnames_match(a2,b2): return True, False
+    if _nm_surnames_match(a1,b2) and _nm_surnames_match(a2,b1): return True, True
     return False, False
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PHASE DETECTION
+# PHASE DETECTION  (без изменений)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _set_complete(h: int, a: int) -> bool:
-    if h == 6 and a <= 4: return True
-    if a == 6 and h <= 4: return True
-    if h == 7 and a in (5, 6): return True
-    if a == 7 and h in (5, 6): return True
+def _set_complete(h, a):
+    if h==6 and a<=4: return True
+    if a==6 and h<=4: return True
+    if h==7 and a in (5,6): return True
+    if a==7 and h in (5,6): return True
     return False
 
-
 def _detect_phase(sets_json, game_home, game_away, server):
-    try:
-        sets = json.loads(sets_json) if sets_json else []
-    except:
-        sets = []
-    if not sets:
-        return None
-    completed = [s for s in sets if _set_complete(s[0], s[1])]
-    current   = next((s for s in reversed(sets) if not _set_complete(s[0], s[1])), sets[-1])
-    g1, g2    = current[0], current[1]
-    games_total = g1 + g2
-
-    if (g1 == 0 and g2 == 0
-            and (game_home == 0 or game_home is None)
-            and (game_away == 0 or game_away is None)
+    try: sets = json.loads(sets_json) if sets_json else []
+    except: sets = []
+    if not sets: return None
+    completed = [s for s in sets if _set_complete(s[0],s[1])]
+    current   = next((s for s in reversed(sets) if not _set_complete(s[0],s[1])), sets[-1])
+    g1,g2     = current[0], current[1]
+    games_total = g1+g2
+    if (g1==0 and g2==0
+            and (game_home==0 or game_home is None)
+            and (game_away==0 or game_away is None)
             and completed):
-        return {"phase": "SET_BREAK",   "label": "Set break"}
-    if g1 == 6 and g2 == 6:
-        return {"phase": "TIEBREAK",    "label": "Tiebreak"}
-    if game_home == 40 and game_away == 40:
-        return {"phase": "DEUCE",       "label": "Deuce"}
+        return {"phase":"SET_BREAK","label":"Set break"}
+    if g1==6 and g2==6: return {"phase":"TIEBREAK","label":"Tiebreak"}
+    if game_home==40 and game_away==40: return {"phase":"DEUCE","label":"Deuce"}
     if game_home is not None and game_away is not None:
-        if server == 1:
-            is_bp = (game_away == 40 and game_home < 40) or (game_away == 50 and game_home == 40)
-        elif server == 2:
-            is_bp = (game_home == 40 and game_away < 40) or (game_home == 50 and game_away == 40)
+        if server==1:
+            is_bp = (game_away==40 and game_home<40) or (game_away==50 and game_home==40)
+        elif server==2:
+            is_bp = (game_home==40 and game_away<40) or (game_home==50 and game_away==40)
         else:
             is_bp = False
-        if is_bp:
-            return {"phase": "BREAK_POINT", "label": "Break point"}
-        if (game_home == 50 and game_away == 40) or (game_home == 40 and game_away == 50):
-            return {"phase": "ADVANTAGE",   "label": "Advantage"}
-    pts_zero = (game_home == 0 or game_home is None) and (game_away == 0 or game_away is None)
+        if is_bp: return {"phase":"BREAK_POINT","label":"Break point"}
+        if (game_home==50 and game_away==40) or (game_home==40 and game_away==50):
+            return {"phase":"ADVANTAGE","label":"Advantage"}
+    pts_zero = (game_home==0 or game_home is None) and (game_away==0 or game_away is None)
     if pts_zero and games_total > 0:
-        if games_total % 2 == 1:
-            return {"phase": "CHANGEOVER", "label": "Changeover"}
-        return {"phase": "POST_GAME",      "label": "Post game"}
-    return {"phase": "IN_POINT", "label": "In play"}
+        return {"phase":"CHANGEOVER","label":"Changeover"} if games_total%2==1 else {"phase":"POST_GAME","label":"Post game"}
+    return {"phase":"IN_POINT","label":"In play"}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TIMELINE BUILDERS  —  ИНВАРИАНТ ПАКЕТА
+# TIMELINE BUILDERS  —  CARRY-FORWARD (ИСПРАВЛЕНО)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _build_thrill_timeline(rows) -> Dict[str, list]:
     """
-    Строит timeline Thrill из строк БД.
+    Строит timeline Thrill с carry-forward по отдельным исходам.
 
-    ИНВАРИАНТ: тик добавляется ТОЛЬКО если оба исхода "4" (P1_back)
-    и "5" (P2_back) присутствуют в одном ts-слоте.
-    Одиночные обновления (только P1 или только P2) пропускаются.
+    Thrill шлёт дельта-обновления: каждая строка в БД содержит ровно один
+    outcome_id ('4' = P1_back, '5' = P2_back). Инвариант пакета (требовать
+    оба исхода в одном ts-слоте) выбрасывал ~20% тиков.
 
-    Carry-forward в фазе симуляции применяется к ПОЛНЫМ состояниям —
-    всегда берём последний известный полный пакет, никогда не смешиваем
-    P1 из одного времени с P2 из другого.
+    Carry-forward: несём последнее известное значение каждого исхода
+    независимо. Тик добавляется как только оба значения были получены
+    хотя бы по одному разу.
 
     Формат: {eid: [(ts, p1_back, p2_back, meta), ...]}
     """
-    # Группируем по (eid, ts)
     by_eid_ts: Dict[str, Dict[float, dict]] = defaultdict(dict)
     for (ts, eid, p1, p2, tname, status, oid, odds,
          sets_json, game_home, game_away, server) in rows:
@@ -294,21 +249,23 @@ def _build_thrill_timeline(rows) -> Dict[str, list]:
             "sets_json": sets_json,
             "game_home": game_home, "game_away": game_away, "server": server,
         })
-        slot[oid] = odds  # "4" = P1_back, "5" = P2_back
+        slot[oid] = odds   # '4' или '5'
 
     result: Dict[str, list] = {}
     for eid, ts_dict in by_eid_ts.items():
         tl = []
+        last_p1: Optional[float] = None
+        last_p2: Optional[float] = None
         for ts in sorted(ts_dict):
             slot = ts_dict[ts]
-            # ИНВАРИАНТ: пропускаем неполные пакеты
-            if "4" not in slot or "5" not in slot:
+            if "4" in slot: last_p1 = float(slot["4"])
+            if "5" in slot: last_p2 = float(slot["5"])
+            if last_p1 is None or last_p2 is None:
                 continue
             meta = {k: slot[k] for k in
-                    ("p1", "p2", "tname", "status", "sets_json",
-                     "game_home", "game_away", "server")
+                    ("p1","p2","tname","status","sets_json","game_home","game_away","server")
                     if k in slot}
-            tl.append((ts, float(slot["4"]), float(slot["5"]), meta))
+            tl.append((ts, last_p1, last_p2, meta))
         if tl:
             result[eid] = tl
     return result
@@ -316,21 +273,21 @@ def _build_thrill_timeline(rows) -> Dict[str, list]:
 
 def _build_sharp_timeline(rows) -> Dict[str, list]:
     """
-    Строит timeline Sharp из строк БД.
+    Строит timeline Sharp с carry-forward по отдельным полям стакана.
 
-    ИНВАРИАНТ: тик добавляется ТОЛЬКО если все четыре значения
-    (p1_back, p1_lay, p2_back, p2_lay) присутствуют в одном ts-слоте.
-    Частичные обновления (только один runner, только back или только lay)
-    пропускаются.
+    Sharp шлёт дельта-обновления: каждый тик содержит 1-3 runner×side из 4.
+    Инвариант пакета выбрасывал ~55% тиков.
 
-    Дополнительно: spread обязан быть валиден в момент пакета (lay > back).
-    Невалидный спред в пакете означает аномалию данных — пакет пропускается.
+    Carry-forward: несём последнее значение каждого из четырёх полей
+    (p1_back, p1_lay, p2_back, p2_lay) независимо. Тик добавляется как
+    только все четыре получены хотя бы по одному разу.
 
-    Carry-forward в симуляции применяется к полному состоянию (все 4 значения).
+    Spread guard применяется к итоговому стабильному состоянию: если
+    lay ≤ back для любого runner — тик пропускается (аномалия данных).
 
     Формат: {eid: [(ts, p1_back, p1_lay, p2_back, p2_lay, meta), ...]}
     """
-    _NEED = frozenset(("p1_back", "p1_lay", "p2_back", "p2_lay"))
+    _FIELDS = ("p1_back", "p1_lay", "p2_back", "p2_lay")
 
     by_eid_ts: Dict[str, Dict[float, dict]] = defaultdict(dict)
     for (ts, eid, mid, p1, p2, status, in_play, betting,
@@ -341,25 +298,26 @@ def _build_sharp_timeline(rows) -> Dict[str, list]:
             "betting": int(betting or 0),
             "mid": mid,
         })
-        key = f"p{runner_idx + 1}_{side}"  # p1_back / p1_lay / p2_back / p2_lay
-        slot[key] = odds
+        slot[f"p{runner_idx + 1}_{side}"] = odds
 
     result: Dict[str, list] = {}
     for eid, ts_dict in by_eid_ts.items():
         tl = []
+        last: Dict[str, Optional[float]] = {f: None for f in _FIELDS}
         for ts in sorted(ts_dict):
             slot = ts_dict[ts]
-            # ИНВАРИАНТ: пропускаем неполные пакеты
-            if not _NEED.issubset(slot):
+            meta = {k: slot[k] for k in
+                    ("p1","p2","status","in_play","betting","mid") if k in slot}
+            for f in _FIELDS:
+                if f in slot:
+                    last[f] = slot[f]
+            if any(v is None for v in last.values()):
                 continue
-            p1b, p1l = float(slot["p1_back"]), float(slot["p1_lay"])
-            p2b, p2l = float(slot["p2_back"]), float(slot["p2_lay"])
-            # Спред должен быть физически корректен в рамках одного пакета
+            p1b, p1l = float(last["p1_back"]), float(last["p1_lay"])
+            p2b, p2l = float(last["p2_back"]), float(last["p2_lay"])
+            # Spread guard: lay должен быть строго больше back
             if p1l <= p1b or p2l <= p2b:
                 continue
-            meta = {k: slot[k] for k in
-                    ("p1", "p2", "status", "in_play", "betting", "mid")
-                    if k in slot}
             tl.append((ts, p1b, p1l, p2b, p2l, meta))
         if tl:
             result[eid] = tl
@@ -371,52 +329,26 @@ def _build_sharp_timeline(rows) -> Dict[str, list]:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _last_hb_before(hb_list: list, ts: float) -> float:
-    """Последний heartbeat строго до ts (бинарный поиск)."""
-    if not hb_list:
-        return 0.0
+    if not hb_list: return 0.0
     idx = bisect.bisect_right(hb_list, ts) - 1
     return hb_list[idx] if idx >= 0 else 0.0
 
 
-def _data_valid(thrill_age: float, sharp_age: float,
-                freshness_sec: float, s_meta: dict,
-                tb1: float, tb2: float,
-                max_thrill_odds: float) -> bool:
-    """
-    Данные пригодны для арбитража если:
-    - оба источника свежие (по heartbeat)
-    - betting включён на Sharp
-    - хотя бы один коэффициент Thrill не превышает cap
-    """
-    if thrill_age > freshness_sec or sharp_age > freshness_sec:
-        return False
-    if not s_meta.get("betting", 1):
-        return False
-    if tb1 > max_thrill_odds and tb2 > max_thrill_odds:
-        return False
-    return True
-
-
-def _make_snap(ts, t_meta: dict,
-               tb1: Optional[float], tb2: Optional[float],
-               sb1: float, sl1: float, sb2: float, sl2: float,
-               arbs: list,
+def _make_snap(ts, t_meta, tb1, tb2, sb1, sl1, sb2, sl2,
                sets_json, game_home, game_away, server) -> dict:
-    try:
-        ps_raw = json.loads(sets_json) if sets_json else []
-    except:
-        ps_raw = []
+    try: ps_raw = json.loads(sets_json) if sets_json else []
+    except: ps_raw = []
     period_scores = [{"home_score": s[0], "away_score": s[1]} for s in ps_raw]
     score = {
-        "period_scores":  period_scores,
+        "period_scores": period_scores,
         "home_gamescore": game_home,
         "away_gamescore": game_away,
         "current_server": server,
     } if period_scores else {}
     return {
-        "player1":        t_meta.get("p1", ""),
-        "player2":        t_meta.get("p2", ""),
-        "tournament":     t_meta.get("tname", ""),
+        "player1":        t_meta.get("p1",""),
+        "player2":        t_meta.get("p2",""),
+        "tournament":     t_meta.get("tname",""),
         "score":          score,
         "score_ts":       ts,
         "thrill_p1_back": tb1,
@@ -425,28 +357,40 @@ def _make_snap(ts, t_meta: dict,
     }
 
 
-def _build_entry(pipeline: dict, recorded_ts: float,
-                 t_meta: dict,
-                 thrill_age: float, sharp_age: float) -> dict:
-    arbs         = pipeline.get("min_arbs") or [None, None, None, None]
-    arb_type_idx = pipeline.get("arb_type_idx", 0)
-    score_changed = (
-        pipeline.get("detected_sets_json") is not None
-        and t_meta.get("sets_json") != pipeline.get("detected_sets_json")
-    )
-    return {
-        "snap":          pipeline["min_snap"],
-        "frozen_sharp":  pipeline["frozen_sharp"],
-        "arbs":          arbs,
-        "profit":        pipeline["min_profit"],
-        "recorded_ts":   recorded_ts,
-        "thrill_age":    round(thrill_age, 1),
-        "sharp_age":     round(sharp_age, 1),
-        "arb_type":      _ARB_LABELS[arb_type_idx],
-        "arb_type_idx":  arb_type_idx,
-        "score_changed": score_changed,
-        # th_event_id / sh_event_id добавляет вызывающая сторона
-    }
+# ══════════════════════════════════════════════════════════════════════════════
+# SHARP LAG BUFFER  (аналог engine/sharp_buffer.py)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class _SharpLag:
+    """
+    Минимальная in-memory реализация SharpBuffer для симуляции.
+    Поле принимается как стабильное только если оно не менялось ≥ lag_sec.
+    """
+    __slots__ = ("_lag", "_stable", "_pending")
+
+    def __init__(self, lag_sec: float):
+        self._lag     = lag_sec
+        self._stable  = {f: None for f in ("p1_back","p1_lay","p2_back","p2_lay")}
+        self._pending = {}   # field -> (value, since_ts)
+
+    def feed(self, updates: dict, now: float) -> None:
+        """updates: {field: value} — только изменившиеся поля."""
+        for field, val in updates.items():
+            if val == self._stable[field]:
+                self._pending.pop(field, None)
+            elif val != self._pending.get(field, (None,))[0]:
+                self._pending[field] = (val, now)
+
+        # Промотируем pending → stable если lag истёк
+        for field in list(self._pending):
+            val, since = self._pending[field]
+            if now - since >= self._lag:
+                self._stable[field] = val
+                del self._pending[field]
+
+    def get(self) -> Tuple:
+        s = self._stable
+        return s["p1_back"], s["p1_lay"], s["p2_back"], s["p2_lay"]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -454,28 +398,22 @@ def _build_entry(pipeline: dict, recorded_ts: float,
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _simulate_pair(
-    t_tl: list,
-    s_tl: list,
-    t_hb_list: list,
-    s_hb_list: list,
+    t_tl:    list,
+    s_tl:    list,
+    t_hb:    list,
+    s_hb:    list,
     swapped: bool,
-    params: dict,
+    params:  dict,
 ) -> list:
     """
     Симулирует торговлю на одной matched паре.
 
-    Аргументы
-    ---------
-    t_tl       Thrill timeline [(ts, p1_back, p2_back, meta), ...]
-               Каждый элемент — ПОЛНЫЙ пакет (оба исхода из одного ts-слота).
-    s_tl       Sharp timeline  [(ts, p1_back, p1_lay, p2_back, p2_lay, meta), ...]
-               Каждый элемент — ПОЛНЫЙ пакет (все 4 значения из одного ts-слота).
-    t_hb_list  Отсортированный список ts heartbeat Thrill для этого event_id.
-    s_hb_list  Отсортированный список ts heartbeat Sharp для этого event_id.
-    swapped    Если True — P1↔P2 у Sharp перестановлены (матч в обратном порядке).
-    params     Словарь параметров симуляции.
-
-    Возвращает список записей истории (без th/sh event_id).
+    Ключевые отличия от предыдущей версии:
+    - Carry-forward уже применён в t_tl / s_tl (build-фаза).
+    - Sharp проходит через _SharpLag буфер (аналог SharpBuffer сканера).
+    - Thrill-коэффициент обнуляется если heartbeat старше _THRILL_STALE_SEC
+      (аналог _THRILL_STALE guard в engine/core.py).
+    - min_profit = минимум за окно [0, window_end] (консервативная оценка).
     """
     min_arb         = params["min_arb"]
     sharp_delay     = params["sharp_delay"]
@@ -483,115 +421,125 @@ def _simulate_pair(
     cooldown        = params["cooldown"]
     freshness_sec   = params["freshness_sec"]
     max_thrill_odds = params["max_thrill_odds"]
+    sharp_lag       = params["sharp_lag"]
+    thrill_stale    = params.get("thrill_stale", _THRILL_STALE_SEC)
 
-    # Объединённая временная шкала всех тиков обоих источников
     all_ts = sorted(set(r[0] for r in t_tl) | set(r[0] for r in s_tl))
 
-    # Текущие полные состояния (carry-forward полного пакета, не отдельных полей)
+    # Carry-forward индексы
     t_idx = s_idx = 0
-    tb1 = tb2 = None                   # Thrill P1_back, P2_back (всегда из одного пакета)
-    sb1 = sl1 = sb2 = sl2 = None       # Sharp p1_back, p1_lay, p2_back, p2_lay
+    tb1 = tb2 = None
     t_meta: dict = {}
-    s_meta: dict = {}
+    t_last_odds_ts: float = 0.0   # время последнего изменения значения Thrill-коэффициента
+
+    # Sharp lag-буфер
+    sharp_buf = _SharpLag(sharp_lag)
+    s_last_odds_ts: float = 0.0   # время последнего изменения значения Sharp-коэффициента
+    _s_prev = (None, None, None, None)  # предыдущее стабильное состояние Sharp
 
     pipeline:       Optional[dict] = None
     cooldown_until: float          = 0.0
     entries:        list           = []
 
     for ts in all_ts:
-        # Обновляем состояние Thrill (carry-forward ПОЛНОГО пакета)
+        # Обновляем Thrill carry-forward
         while t_idx < len(t_tl) and t_tl[t_idx][0] <= ts:
-            _, tb1, tb2, t_meta = t_tl[t_idx]
+            new_ts, new_b1, new_b2, new_meta = t_tl[t_idx]
+            if new_b1 != tb1 or new_b2 != tb2:
+                t_last_odds_ts = new_ts   # фиксируем время изменения значений
+            tb1, tb2, t_meta = new_b1, new_b2, new_meta
             t_idx += 1
 
-        # Обновляем состояние Sharp (carry-forward ПОЛНОГО пакета)
+        # Обновляем Sharp через lag-буфер
+        updates: dict = {}
         while s_idx < len(s_tl) and s_tl[s_idx][0] <= ts:
             row = s_tl[s_idx]
             if swapped:
-                sb1, sl1, sb2, sl2 = row[3], row[4], row[1], row[2]
+                updates["p1_back"] = row[3]; updates["p1_lay"] = row[4]
+                updates["p2_back"] = row[1]; updates["p2_lay"] = row[2]
             else:
-                sb1, sl1, sb2, sl2 = row[1], row[2], row[3], row[4]
+                updates["p1_back"] = row[1]; updates["p1_lay"] = row[2]
+                updates["p2_back"] = row[3]; updates["p2_lay"] = row[4]
             s_meta = row[5]
             s_idx += 1
+        if updates:
+            sharp_buf.feed(updates, ts)
 
-        # Базовые проверки — нужны данные обоих источников
-        if tb1 is None or tb2 is None:
-            continue
-        if sb1 is None or sb2 is None:
-            continue
-        if t_meta.get("status") != "live":
-            continue
+        sb1, sl1, sb2, sl2 = sharp_buf.get()
+        # Отслеживаем время последнего изменения Sharp-коэффициента
+        _s_cur = (sb1, sl1, sb2, sl2)
+        if _s_cur != _s_prev and any(v is not None for v in _s_cur):
+            s_last_odds_ts = ts
+            _s_prev = _s_cur
 
-        sets_json = t_meta.get("sets_json")
-        if not sets_json or sets_json == "[]":
-            continue
-
-        game_home = t_meta.get("game_home")
-        game_away = t_meta.get("game_away")
-        server    = t_meta.get("server")
+        # Нет данных
+        if tb1 is None or tb2 is None:          continue
+        if sb1 is None or sb2 is None:          continue
+        if t_meta.get("status") != "live":      continue
+        sj = t_meta.get("sets_json")
+        if not sj or sj == "[]":                continue
 
         # Freshness через heartbeat
-        last_t_hb  = _last_hb_before(t_hb_list, ts)
-        last_s_hb  = _last_hb_before(s_hb_list, ts)
-        thrill_age = ts - last_t_hb if last_t_hb > 0 else freshness_sec + 1
-        sharp_age  = ts - last_s_hb if last_s_hb > 0 else freshness_sec + 1
+        lt = _last_hb_before(t_hb, ts)
+        ls = _last_hb_before(s_hb, ts)
+        t_age = ts - lt if lt > 0 else freshness_sec + 1
+        s_age = ts - ls if ls > 0 else freshness_sec + 1
 
-        # Thrill с cap на максимальный коэффициент
-        tb1_c = tb1 if tb1 <= max_thrill_odds else None
-        tb2_c = tb2 if tb2 <= max_thrill_odds else None
+        if s_age > freshness_sec:               continue
+        if not (s_meta or {}).get("betting", 1): continue
 
-        valid = _data_valid(thrill_age, sharp_age, freshness_sec,
-                            s_meta, tb1, tb2, max_thrill_odds)
-
-        if ts < cooldown_until:
+        # THRILL STALE GUARD: если коэффициенты Thrill не менялись дольше thrill_stale —
+        # не используем их. Это ключевое отличие от heartbeat-age:
+        # heartbeat может тикать пока коэффициент завис на старом значении.
+        # Пример: Nava/Mmoh — всего 2 строки в Thrill, carry-forward держит
+        # 1.49/2.42 на протяжении часа пока Sharp продолжает меняться → ложная вилка.
+        if t_last_odds_ts > 0 and ts - t_last_odds_ts > thrill_stale:
             continue
+
+        # SHARP STALE GUARD: симметрично — если Sharp не обновлялся дольше thrill_stale,
+        # рынок закрыт или завис. Пример: Navarro/Sun — Sharp закрыл рынок в 01:05
+        # (odds=0.0), carry-forward держит последний p1_lay≈1.19, Thrill продолжает
+        # давать растущий коэффициент → ложная вилка +93%.
+        if s_last_odds_ts > 0 and ts - s_last_odds_ts > thrill_stale:
+            continue
+
+        # Thrill freshness (мягкий guard, отдельно от stale)
+        if t_age > freshness_sec:               continue
+
+        # Cap на экстремальные коэффициенты Thrill
+        tb1c = tb1 if tb1 <= max_thrill_odds else None
+        tb2c = tb2 if tb2 <= max_thrill_odds else None
+
+        arbs = _calc_arbs(tb1c, tb2c, sb1, sl1, sb2, sl2)
+        best_v = _best_arb(arbs)
+
+        if ts < cooldown_until:                 continue
 
         # ── Pipeline не существует ───────────────────────────────────────────
         if pipeline is None:
-            if not valid:
-                continue
-            arbs   = _calc_arbs(tb1_c, tb2_c, sb1, sl1, sb2, sl2)
-            best_v = _best_arb(arbs)
             if best_v is None or best_v < min_arb:
                 continue
-
-            arb_type_idx = max(
-                range(4),
-                key=lambda i: arbs[i] if arbs[i] is not None else -999.0,
-            )
+            arb_idx = max(range(4), key=lambda i: arbs[i] if arbs[i] is not None else -999.0)
             pipeline = {
-                "detected_ts":        ts,
-                "phase":              "waiting",
-                "frozen_sharp":       None,
-                "arb_type_idx":       arb_type_idx,
-                "min_profit":         None,
-                "min_arbs":           None,
-                "min_snap":           None,
-                "detected_sets_json": sets_json,
-                "last_thrill_age":    thrill_age,
-                "last_sharp_age":     sharp_age,
+                "detected_ts": ts,
+                "phase":       "waiting",
+                "frozen_sharp": None,
+                "arb_type_idx": arb_idx,
+                "min_profit":   None,
+                "min_arbs":     None,
+                "min_snap":     None,
+                "det_sets":     sj,
+                "last_t_age":   t_age,
+                "last_s_age":   s_age,
             }
-            # Не делаем continue — сразу проверяем переход в tracking (если delay=0)
+            # Не прерываемся — сразу проверяем переход в tracking (если delay=0)
 
-        # ── Pipeline активен ─────────────────────────────────────────────────
         elapsed = ts - pipeline["detected_ts"]
-
-        # Невалидные данные убивают pipeline
-        if not valid:
-            if (pipeline["phase"] == "tracking"
-                    and pipeline["min_profit"] is not None
-                    and pipeline["min_profit"] > 0):
-                entries.append(_build_entry(
-                    pipeline, ts, t_meta, thrill_age, sharp_age))
-                cooldown_until = ts + cooldown
-            pipeline = None
-            continue
 
         # ── Waiting → Tracking ───────────────────────────────────────────────
         if pipeline["phase"] == "waiting":
             if elapsed < sharp_delay:
                 continue
-            # Фиксируем Sharp котировки в момент перехода
             pipeline["phase"]        = "tracking"
             pipeline["frozen_sharp"] = {
                 "p1_back": sb1, "p1_lay": sl1,
@@ -600,36 +548,49 @@ def _simulate_pair(
 
         # ── Tracking ─────────────────────────────────────────────────────────
         if pipeline["phase"] == "tracking":
-            pipeline["last_thrill_age"] = thrill_age
-            pipeline["last_sharp_age"]  = sharp_age
+            pipeline["last_t_age"] = t_age
+            pipeline["last_s_age"] = s_age
 
-            # Profit считается по FROZEN Sharp + текущий Thrill
-            fs   = pipeline["frozen_sharp"]
-            arbs = _calc_arbs(
-                tb1_c, tb2_c,
+            fs = pipeline["frozen_sharp"]
+            arbs2 = _calc_arbs(
+                tb1c, tb2c,
                 fs["p1_back"], fs["p1_lay"],
                 fs["p2_back"], fs["p2_lay"],
             )
-            profit = arbs[pipeline["arb_type_idx"]]
+            profit = arbs2[pipeline["arb_type_idx"]]
 
-            # Запоминаем МИНИМАЛЬНЫЙ profit (худший тик за окно)
+            # Минимальный profit за окно (худший тик — консервативная оценка)
             if profit is not None and (
                     pipeline["min_profit"] is None
                     or profit < pipeline["min_profit"]):
                 pipeline["min_profit"] = profit
-                pipeline["min_arbs"]   = arbs
+                pipeline["min_arbs"]   = arbs2
                 pipeline["min_snap"]   = _make_snap(
-                    ts, t_meta, tb1_c, tb2_c,
-                    sb1, sl1, sb2, sl2,
-                    arbs, sets_json, game_home, game_away, server,
+                    ts, t_meta, tb1c, tb2c,
+                    sb1, sl1, sb2, sl2, sj,
+                    t_meta.get("game_home"), t_meta.get("game_away"),
+                    t_meta.get("server"),
                 )
 
-            # Окно закрыто
             if elapsed >= window_end:
                 if (pipeline["min_profit"] is not None
                         and pipeline["min_profit"] > 0):
-                    entries.append(_build_entry(
-                        pipeline, ts, t_meta, thrill_age, sharp_age))
+                    snap = pipeline["min_snap"]
+                    score_changed = (snap and
+                        snap.get("score") and
+                        sj != pipeline["det_sets"])
+                    entries.append({
+                        "snap":          snap,
+                        "frozen_sharp":  fs,
+                        "arbs":          pipeline["min_arbs"],
+                        "profit":        pipeline["min_profit"],
+                        "recorded_ts":   ts,
+                        "thrill_age":    round(pipeline["last_t_age"], 1),
+                        "sharp_age":     round(pipeline["last_s_age"], 1),
+                        "arb_type":      _ARB_LABELS[pipeline["arb_type_idx"]],
+                        "arb_type_idx":  pipeline["arb_type_idx"],
+                        "score_changed": bool(score_changed),
+                    })
                 cooldown_until = ts + cooldown
                 pipeline = None
 
@@ -638,12 +599,19 @@ def _simulate_pair(
             and pipeline["phase"] == "tracking"
             and pipeline["min_profit"] is not None
             and pipeline["min_profit"] > 0):
-        last_ts = all_ts[-1] if all_ts else 0.0
-        entries.append(_build_entry(
-            pipeline, last_ts, t_meta,
-            pipeline["last_thrill_age"],
-            pipeline["last_sharp_age"],
-        ))
+        snap = pipeline.get("min_snap")
+        entries.append({
+            "snap":          snap,
+            "frozen_sharp":  pipeline["frozen_sharp"],
+            "arbs":          pipeline["min_arbs"],
+            "profit":        pipeline["min_profit"],
+            "recorded_ts":   all_ts[-1] if all_ts else 0.0,
+            "thrill_age":    round(pipeline["last_t_age"], 1),
+            "sharp_age":     round(pipeline["last_s_age"], 1),
+            "arb_type":      _ARB_LABELS[pipeline["arb_type_idx"]],
+            "arb_type_idx":  pipeline["arb_type_idx"],
+            "score_changed": False,
+        })
 
     return entries
 
@@ -652,38 +620,36 @@ def _simulate_pair(
 # MAIN ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════════
 
-def compute_history(db_path: str,
-                    limit:           int   = 100,
-                    min_arb:         float = 2.0,
-                    sharp_delay:     float = 3.0,
-                    window_start:    float = 15.0,
-                    window_end:      float = 20.0,
-                    cooldown:        float = 60.0,
-                    freshness_sec:   float = 45.0,
-                    max_thrill_odds: float = 30.0,
-                    lookback_hours:  float = 0.0) -> list:
+def compute_history(
+        db_path:         str,
+        limit:           int   = 100,
+        min_arb:         float = 2.0,
+        sharp_delay:     float = 3.0,
+        window_start:    float = 15.0,   # не используется в расчёте, сохранён для совместимости UI
+        window_end:      float = 20.0,
+        cooldown:        float = 60.0,
+        freshness_sec:   float = 45.0,
+        max_thrill_odds: float = 30.0,
+        lookback_hours:  float = 0.0,
+        sharp_lag:       float = 2.0,
+        thrill_stale:    float = _THRILL_STALE_SEC,
+) -> list:
 
     conn = sqlite3.connect(db_path, check_same_thread=False)
     cur  = conn.cursor()
 
     ts_cutoff = (time.time() - lookback_hours * 3600) if lookback_hours > 0 else 0.0
     tf = "AND ts >= ?" if ts_cutoff > 0 else ""
-    tp = (ts_cutoff,) if ts_cutoff > 0 else ()
+    tp = (ts_cutoff,)  if ts_cutoff > 0 else ()
 
-    # ── 1. Heartbeat timelines ───────────────────────────────────────────────
-    cur.execute(
-        f"SELECT ts, source, event_id FROM heartbeat WHERE 1=1 {tf} ORDER BY ts",
-        tp,
-    )
+    # ── Heartbeat ────────────────────────────────────────────────────────────
+    cur.execute(f"SELECT ts, source, event_id FROM heartbeat WHERE 1=1 {tf} ORDER BY ts", tp)
     thrill_hb: Dict[str, list] = defaultdict(list)
     sharp_hb:  Dict[str, list] = defaultdict(list)
     for hb_ts, source, eid in cur.fetchall():
-        if source == "thrill":
-            thrill_hb[eid].append(hb_ts)
-        else:
-            sharp_hb[eid].append(hb_ts)
+        (thrill_hb if source == "thrill" else sharp_hb)[eid].append(hb_ts)
 
-    # ── 2. Thrill rows ───────────────────────────────────────────────────────
+    # ── Thrill rows ──────────────────────────────────────────────────────────
     cur.execute(f"""
         SELECT ts, event_id, player1, player2, tournament_name, status,
                outcome_id, odds, sets_json, game_home, game_away, server
@@ -695,7 +661,7 @@ def compute_history(db_path: str,
     """, tp)
     thrill_rows = cur.fetchall()
 
-    # ── 3. Sharp WS rows ─────────────────────────────────────────────────────
+    # ── Sharp rows ────────────────────────────────────────────────────────────
     cur.execute(f"""
         SELECT ts, event_id, market_id, player1, player2,
                status, in_play, betting_enabled,
@@ -710,35 +676,33 @@ def compute_history(db_path: str,
 
     conn.close()
 
-    # ── 4. Build timelines (инвариант пакета применяется здесь) ─────────────
+    # ── Build timelines (carry-forward) ──────────────────────────────────────
     thrill_tl = _build_thrill_timeline(thrill_rows)
     sharp_tl  = _build_sharp_timeline(sharp_rows)
 
-    # ── 5. Match events by player names ──────────────────────────────────────
-    th_names: Dict[str, Tuple[str, str]] = {
-        eid: (tl[-1][3].get("p1", ""), tl[-1][3].get("p2", ""))
+    # ── Match events ─────────────────────────────────────────────────────────
+    th_names = {
+        eid: (tl[-1][3].get("p1",""), tl[-1][3].get("p2",""))
         for eid, tl in thrill_tl.items() if tl
     }
-    sh_names: Dict[str, Tuple[str, str]] = {
-        eid: (tl[-1][5].get("p1", ""), tl[-1][5].get("p2", ""))
+    sh_names = {
+        eid: (tl[-1][5].get("p1",""), tl[-1][5].get("p2",""))
         for eid, tl in sharp_tl.items() if tl
     }
 
     matched: List[Tuple[str, str, bool]] = []
     used_sh: set = set()
     for th_eid, (t_p1, t_p2) in th_names.items():
-        if not t_p1 or not t_p2:
-            continue
+        if not t_p1 or not t_p2: continue
         for sh_eid, (s_p1, s_p2) in sh_names.items():
-            if sh_eid in used_sh or not s_p1 or not s_p2:
-                continue
+            if sh_eid in used_sh or not s_p1 or not s_p2: continue
             ok, sw = _match_pair(t_p1, t_p2, s_p1, s_p2)
             if ok:
                 matched.append((th_eid, sh_eid, sw))
                 used_sh.add(sh_eid)
                 break
 
-    # ── 6. Simulate each matched pair ────────────────────────────────────────
+    # ── Simulate ──────────────────────────────────────────────────────────────
     sim_params = {
         "min_arb":         min_arb,
         "sharp_delay":     sharp_delay,
@@ -746,17 +710,16 @@ def compute_history(db_path: str,
         "cooldown":        cooldown,
         "freshness_sec":   freshness_sec,
         "max_thrill_odds": max_thrill_odds,
+        "sharp_lag":       sharp_lag,
+        "thrill_stale":    thrill_stale,
     }
 
     history: list = []
     for th_eid, sh_eid, swapped in matched:
         entries = _simulate_pair(
-            thrill_tl[th_eid],
-            sharp_tl[sh_eid],
-            thrill_hb.get(th_eid, []),
-            sharp_hb.get(sh_eid, []),
-            swapped,
-            sim_params,
+            thrill_tl[th_eid], sharp_tl[sh_eid],
+            thrill_hb.get(th_eid, []), sharp_hb.get(sh_eid, []),
+            swapped, sim_params,
         )
         for e in entries:
             e["th_event_id"] = th_eid
@@ -785,6 +748,8 @@ def build_history_response(db_path: str, params: dict) -> dict:
             freshness_sec   = float(params.get("freshness_sec",  45.0)),
             max_thrill_odds = float(params.get("max_thrill_odds",30.0)),
             lookback_hours  = float(params.get("lookback_hours",  0.0)),
+            sharp_lag       = float(params.get("sharp_lag",       2.0)),
+            thrill_stale    = float(params.get("thrill_stale",  180.0)),
         )
     except Exception as exc:
         log.error("history compute error: %s", exc, exc_info=True)
@@ -801,7 +766,7 @@ def build_history_response(db_path: str, params: dict) -> dict:
         time_range = ""
         if t_min and t_max:
             import datetime as _dt
-            tfmt       = lambda ts: _dt.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+            tfmt = lambda ts: _dt.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
             time_range = f"{tfmt(t_min)} → {tfmt(t_max)}"
     except:
         t_rows = s_rows = hb_rows = 0
